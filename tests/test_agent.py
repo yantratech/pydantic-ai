@@ -403,6 +403,45 @@ def test_buffered_output_strategy_patches_and_submits_buffer():
     )
 
 
+def test_buffered_output_strategy_ignores_deferred_tool_requests_output_type():
+    seen_infos: list[AgentInfo] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        seen_infos.append(info)
+        output_tool_name = info.output_tools[0].name
+
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        output_tool_name,
+                        {'a': 1, 'b': 'buffered'},
+                        tool_call_id='stage-output',
+                    )
+                ]
+            )
+
+        return ModelResponse(parts=[ToolCallPart(output_tool_name, {}, tool_call_id='submit-output')])
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=[Foo, DeferredToolRequests],
+        output_strategy=BufferedOutputStrategy(),
+    )
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=1, b='buffered')
+    assert seen_infos
+    assert [tool.name for tool in seen_infos[0].output_tools or []] == ['final_result']
+    function_tool_names = {tool.name for tool in seen_infos[0].function_tools}
+    assert 'read_final_result_buffer' in function_tool_names
+    assert 'patch_final_result_buffer' in function_tool_names
+    assert 'read_DeferredToolRequests_buffer' not in function_tool_names
+    assert 'patch_DeferredToolRequests_buffer' not in function_tool_names
+
+
 class InvoiceOutput(BaseModel):
     invoice_id: str
     total: int
