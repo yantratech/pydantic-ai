@@ -54,6 +54,7 @@ from pydantic_ai._utils import PeekableAsyncStream
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
+    INVALID_JSON_KEY,
     CompactionPart,
     InstructionPart,
     ToolSearchCallPart,
@@ -139,6 +140,8 @@ with try_import() as imports_successful:
         AnthropicModel,
         AnthropicModelSettings,
         AnthropicStreamedResponse,
+        _build_mcp_args_prefix,  # pyright: ignore[reportPrivateUsage]
+        _map_server_tool_use_block,  # pyright: ignore[reportPrivateUsage]
         _map_usage,  # pyright: ignore[reportPrivateUsage]
     )
     from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
@@ -11239,6 +11242,205 @@ Fix the errors and try again.\
             },
         ]
     )
+
+
+async def test_messages_create_continues_pause_turn_with_exact_assistant_content(allow_model_requests: None):
+    """Anthropic `pause_turn` is a transport continuation, not a finished model turn.
+
+    This is a direct provider-unit test rather than VCR: the behavior requires a precise
+    two-response sequence, and the assertion is that the second request includes the raw
+    paused assistant content exactly before the final response is returned.
+    """
+    pause_content: list[BetaContentBlock] = [
+        BetaTextBlock(type='text', text='I need to run code.'),
+        BetaServerToolUseBlock.model_construct(
+            id='srvtoolu_pause',
+            type='server_tool_use',
+            name='bash_code_execution',
+            input={},
+        ),
+    ]
+    paused = BetaMessage(
+        id='msg_pause',
+        container=BetaContainer(
+            id='cntr_pause',
+            expires_at=datetime.now(timezone.utc),
+            skills=[],
+        ),
+        content=pause_content,
+        model='claude-test',
+        role='assistant',
+        stop_reason='pause_turn',
+        type='message',
+        usage=BetaUsage(input_tokens=10, output_tokens=2),
+    )
+    final = BetaMessage(
+        id='msg_final',
+        content=[BetaTextBlock(type='text', text='done')],
+        model='claude-test',
+        role='assistant',
+        stop_reason='end_turn',
+        type='message',
+        usage=BetaUsage(input_tokens=11, output_tokens=3),
+    )
+    mock_client = MockAnthropic.create_mock([paused, final])
+    model = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+
+    response = await model._messages_create(  # pyright: ignore[reportPrivateUsage]
+        [],
+        False,
+        {},
+        ModelRequestParameters(),
+    )
+
+    assert response.content == [*pause_content, *final.content]
+    assert response.usage.input_tokens == 21
+    assert response.usage.output_tokens == 5
+    calls = get_mock_chat_completion_kwargs(mock_client)
+    assert len(calls) == 2
+    assert calls[1]['container'] == 'cntr_pause'
+    assert calls[1]['messages'] == snapshot(
+        [
+            {
+                'role': 'assistant',
+                'content': [
+                    {'text': 'I need to run code.', 'type': 'text'},
+                    {'id': 'srvtoolu_pause', 'input': {}, 'name': 'bash_code_execution', 'type': 'server_tool_use'},
+                ],
+            }
+        ]
+    )
+
+
+async def test_streaming_pause_turn_continuation_accumulates_usage(allow_model_requests: None):
+    first_stream: list[MockRawMessageStreamEvent] = [
+        BetaRawMessageStartEvent(
+            message=BetaMessage(
+                id='msg_pause',
+                content=[],
+                model='claude-test',
+                role='assistant',
+                stop_reason=None,
+                type='message',
+                usage=BetaUsage(input_tokens=10, output_tokens=1),
+            ),
+            type='message_start',
+        ),
+        BetaRawContentBlockStartEvent(
+            content_block=BetaTextBlock(text='working ', type='text'),
+            index=0,
+            type='content_block_start',
+        ),
+        BetaRawContentBlockStopEvent(index=0, type='content_block_stop'),
+        BetaRawMessageDeltaEvent(
+            delta=Delta(stop_reason='pause_turn'),
+            usage=BetaMessageDeltaUsage(output_tokens=2),
+            type='message_delta',
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+    second_stream: list[MockRawMessageStreamEvent] = [
+        BetaRawMessageStartEvent(
+            message=BetaMessage(
+                id='msg_final',
+                content=[],
+                model='claude-test',
+                role='assistant',
+                stop_reason=None,
+                type='message',
+                usage=BetaUsage(input_tokens=20, output_tokens=1),
+            ),
+            type='message_start',
+        ),
+        BetaRawContentBlockStartEvent(
+            content_block=BetaTextBlock(text='done', type='text'),
+            index=0,
+            type='content_block_start',
+        ),
+        BetaRawContentBlockStopEvent(index=0, type='content_block_stop'),
+        BetaRawMessageDeltaEvent(
+            delta=Delta(stop_reason='end_turn'),
+            usage=BetaMessageDeltaUsage(output_tokens=3),
+            type='message_delta',
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+    mock_client = MockAnthropic.create_stream_mock([first_stream, second_stream])
+    model = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(model)
+
+    async with agent.run_stream('hello') as result:
+        output = await result.get_output()
+
+    assert output == 'working done'
+    response = message(result.all_messages(), ModelResponse, index=-1)
+    assert response.usage == snapshot(
+        RequestUsage(input_tokens=30, output_tokens=4, details={'input_tokens': 30, 'output_tokens': 4})
+    )
+    assert response.provider_response_id == 'msg_final'
+    calls = get_mock_chat_completion_kwargs(mock_client)
+    assert len(calls) == 2
+    assert calls[1]['messages'] == snapshot(
+        [
+            {'role': 'user', 'content': [{'text': 'hello', 'type': 'text'}]},
+            {'role': 'assistant', 'content': [{'text': 'working ', 'type': 'text'}]},
+        ]
+    )
+
+
+def _server_tool_use_block(name: str, input_value: Any) -> BetaServerToolUseBlock:
+    return BetaServerToolUseBlock.model_construct(
+        id=f'srvtoolu_{name}',
+        type='server_tool_use',
+        name=name,
+        input=input_value,
+    )
+
+
+def test_anthropic_code_execution_tool_input_coerces_recoverable_json():
+    part = _map_server_tool_use_block(
+        _server_tool_use_block(
+            'bash_code_execution',
+            {INVALID_JSON_KEY: '{"command": "create", "path": "/workspace/messages.json"'},
+        ),
+        'anthropic',
+    )
+
+    assert part.args == {'command': 'create', 'path': '/workspace/messages.json'}
+
+
+def test_anthropic_code_execution_tool_input_preserves_irrecoverable_json():
+    input_value = {INVALID_JSON_KEY: '{"command": "create", "path": "unterminated'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('bash_code_execution', input_value), 'anthropic')
+
+    assert part.args == input_value
+
+
+def test_non_code_execution_native_tool_input_is_unaffected():
+    input_value = {INVALID_JSON_KEY: '{"url": "https://example.com"'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('web_fetch', input_value), 'anthropic')
+
+    assert part.args == input_value
+
+
+def test_build_mcp_args_prefix_ends_with_tool_args_key():
+    prefix = _build_mcp_args_prefix(
+        NativeToolCallPart(
+            provider_name='anthropic',
+            tool_name='mcp_server:example',
+            args={'tool_name': 'search', 'action': 'call_tool', 'tool_args': {'q': 'hello'}},
+            tool_call_id='toolu_mcp',
+        )
+    )
+
+    assert prefix.endswith('"tool_args":')
+    assert json.loads(prefix + json.dumps({'q': 'hello'}) + '}') == {
+        'tool_name': 'search',
+        'action': 'call_tool',
+        'tool_args': {'q': 'hello'},
+    }
 
 
 async def test_stream_cancel(allow_model_requests: None):

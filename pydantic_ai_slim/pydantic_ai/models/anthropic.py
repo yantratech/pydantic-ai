@@ -1,6 +1,7 @@
 from __future__ import annotations as _annotations
 
 import io
+import json
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
 from contextlib import asynccontextmanager, contextmanager
@@ -20,6 +21,7 @@ from .._utils import guard_tool_call_id as _guard_tool_call_id, is_str_dict
 from ..capabilities.abstract import AbstractCapability
 from ..exceptions import ModelAPIError, UserError
 from ..messages import (
+    INVALID_JSON_KEY,
     AudioUrl,
     BinaryContent,
     CachePoint,
@@ -84,6 +86,7 @@ from . import (
     download_item,
     get_user_agent,
 )
+from ._code_execution import replace_code_execution_files_in_tool_returns
 from ._tool_choice import ResolvedToolChoice, resolve_tool_choice
 
 _FINISH_REASON_MAP: dict[BetaStopReason, FinishReason] = {
@@ -117,6 +120,7 @@ try:
         BetaBashCodeExecutionToolResultBlock,
         BetaBashCodeExecutionToolResultBlockParam,
         BetaCacheControlEphemeralParam,
+        BetaCacheCreation,
         BetaCitationsConfigParam,
         BetaCitationsDelta,
         BetaCodeExecutionTool20250825Param,
@@ -164,6 +168,7 @@ try:
         BetaRequestMCPServerURLDefinitionParam,
         BetaServerToolCaller,
         BetaServerToolCaller20260120,
+        BetaServerToolUsage,
         BetaServerToolUseBlock,
         BetaServerToolUseBlockParam,
         BetaSignatureDelta,
@@ -766,33 +771,59 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
         self._validate_task_budget_vs_context_management(model_settings, context_management)
         container = self._get_container(messages, model_settings)
 
+        request_kwargs: dict[str, Any] = {
+            'max_tokens': model_settings.get('max_tokens', 4096),
+            'system': system_prompt or OMIT,
+            'model': self._model_name,
+            'tools': tools or OMIT,
+            'tool_choice': tool_choice or OMIT,
+            'mcp_servers': mcp_servers or OMIT,
+            'output_config': output_config or OMIT,
+            'betas': sorted(betas) or OMIT,
+            'stream': stream,
+            'cache_control': auto_cache_control or OMIT,
+            'thinking': self._translate_thinking(model_settings, model_request_parameters),
+            'stop_sequences': model_settings.get('stop_sequences', OMIT),
+            'temperature': model_settings.get('temperature', OMIT),
+            'top_p': model_settings.get('top_p', OMIT),
+            'top_k': model_settings.get('top_k', OMIT),
+            'timeout': model_settings.get('timeout', NOT_GIVEN),
+            'metadata': model_settings.get('anthropic_metadata', OMIT),
+            'context_management': context_management or OMIT,
+            'container': container or OMIT,
+            'service_tier': _resolve_anthropic_service_tier(model_settings),
+            'speed': self._effective_speed(model_settings, anthropic_profile),
+            'extra_headers': extra_headers,
+            'extra_body': model_settings.get('extra_body'),
+        }
+        create_message = cast(Any, self.client.beta.messages.create)
         with _map_api_errors(self.model_name):
-            return await self.client.beta.messages.create(
-                max_tokens=model_settings.get('max_tokens', 4096),
-                system=system_prompt or OMIT,
-                messages=anthropic_messages,
-                model=self._model_name,
-                tools=tools or OMIT,
-                tool_choice=tool_choice or OMIT,
-                mcp_servers=mcp_servers or OMIT,
-                output_config=output_config or OMIT,
-                betas=sorted(betas) or OMIT,
-                stream=stream,
-                cache_control=auto_cache_control or OMIT,
-                thinking=self._translate_thinking(model_settings, model_request_parameters),
-                stop_sequences=model_settings.get('stop_sequences', OMIT),
-                temperature=model_settings.get('temperature', OMIT),
-                top_p=model_settings.get('top_p', OMIT),
-                top_k=model_settings.get('top_k', OMIT),
-                timeout=model_settings.get('timeout', NOT_GIVEN),
-                metadata=model_settings.get('anthropic_metadata', OMIT),
-                context_management=context_management or OMIT,
-                container=container or OMIT,
-                service_tier=_resolve_anthropic_service_tier(model_settings),
-                speed=self._effective_speed(model_settings, anthropic_profile),
-                extra_headers=extra_headers,
-                extra_body=model_settings.get('extra_body'),
+            response = await create_message(**request_kwargs, messages=anthropic_messages)
+
+        if stream:
+            return cast(
+                AsyncStream[BetaRawMessageStreamEvent],
+                _AnthropicPauseTurnContinuationStream(self, response, request_kwargs, anthropic_messages),
             )
+
+        accumulated_usage = response.usage
+        paused_blocks: list[BetaContentBlock] = []
+        while response.stop_reason == 'pause_turn':
+            paused_blocks.extend(response.content)
+            anthropic_messages.append(_assistant_message_param_from_blocks(response.content))
+            if response.container:
+                request_kwargs['container'] = response.container.id
+            with _map_api_errors(self.model_name):
+                response = await create_message(**request_kwargs, messages=anthropic_messages)
+            accumulated_usage = _merge_anthropic_usage(accumulated_usage, response.usage)
+
+        if paused_blocks:
+            return response.model_copy(
+                update={'content': [*paused_blocks, *response.content], 'usage': accumulated_usage}
+            )
+        if accumulated_usage is response.usage:
+            return response
+        return response.model_copy(update={'usage': accumulated_usage})
 
     @staticmethod
     def _add_compaction_params(
@@ -1324,6 +1355,9 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
         model_settings: AnthropicModelSettings,
     ) -> tuple[str | list[BetaTextBlockParam], list[BetaMessageParam]]:
         """Just maps a `pydantic_ai.Message` to a `anthropic.types.MessageParam`."""
+        messages = replace_code_execution_files_in_tool_returns(
+            messages, model_request_parameters.native_tools, self.system
+        )
         system_prompt_parts: list[str] = []
         anthropic_messages: list[BetaMessageParam] = []
         # Cross-provider files are dropped silently here, not raised via
@@ -2319,6 +2353,306 @@ def _map_usage(
     )
 
 
+def _sum_optional_usage_int(left: int | None, right: int | None) -> int | None:
+    if left is None and right is None:
+        return None
+    return (left or 0) + (right or 0)
+
+
+def _merge_beta_cache_creation(
+    left: BetaCacheCreation | None, right: BetaCacheCreation | None
+) -> BetaCacheCreation | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return BetaCacheCreation(
+        ephemeral_1h_input_tokens=left.ephemeral_1h_input_tokens + right.ephemeral_1h_input_tokens,
+        ephemeral_5m_input_tokens=left.ephemeral_5m_input_tokens + right.ephemeral_5m_input_tokens,
+    )
+
+
+def _merge_beta_server_tool_usage(
+    left: BetaServerToolUsage | None, right: BetaServerToolUsage | None
+) -> BetaServerToolUsage | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return BetaServerToolUsage(
+        web_fetch_requests=left.web_fetch_requests + right.web_fetch_requests,
+        web_search_requests=left.web_search_requests + right.web_search_requests,
+    )
+
+
+def _merge_anthropic_usage(left: BetaUsage, right: BetaUsage) -> BetaUsage:
+    iterations = [*(left.iterations or []), *(right.iterations or [])]
+    return BetaUsage(
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        cache_creation_input_tokens=_sum_optional_usage_int(
+            left.cache_creation_input_tokens, right.cache_creation_input_tokens
+        ),
+        cache_read_input_tokens=_sum_optional_usage_int(left.cache_read_input_tokens, right.cache_read_input_tokens),
+        cache_creation=_merge_beta_cache_creation(left.cache_creation, right.cache_creation),
+        inference_geo=right.inference_geo or left.inference_geo,
+        iterations=iterations or None,
+        server_tool_use=_merge_beta_server_tool_usage(left.server_tool_use, right.server_tool_use),
+        service_tier=right.service_tier or left.service_tier,
+        speed=right.speed or left.speed,
+    )
+
+
+def _merge_request_usage(
+    left: usage.RequestUsage | None, right: usage.RequestUsage | None
+) -> usage.RequestUsage | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left + right
+
+
+def _content_block_to_param(block: BetaContentBlock) -> BetaContentBlockParam:
+    return cast(BetaContentBlockParam, block.model_dump(mode='json', exclude_none=True))
+
+
+def _assistant_message_param_from_blocks(blocks: list[BetaContentBlock]) -> BetaMessageParam:
+    return BetaMessageParam(role='assistant', content=[_content_block_to_param(block) for block in blocks])
+
+
+def _offset_stream_event_index(event: BetaRawMessageStreamEvent, index_offset: int) -> BetaRawMessageStreamEvent:
+    if index_offset == 0:
+        return event
+    if isinstance(event, BetaRawContentBlockStartEvent | BetaRawContentBlockDeltaEvent | BetaRawContentBlockStopEvent):
+        return event.model_copy(update={'index': event.index + index_offset})
+    return event
+
+
+def _apply_stream_delta_to_block(block: BetaContentBlock, delta: Any, json_fragments: list[str]) -> BetaContentBlock:
+    if isinstance(delta, BetaTextDelta):
+        return block.model_copy(update={'text': getattr(block, 'text', '') + delta.text})
+    if isinstance(delta, BetaThinkingDelta):
+        return block.model_copy(update={'thinking': getattr(block, 'thinking', '') + delta.thinking})
+    if isinstance(delta, BetaSignatureDelta):
+        return block.model_copy(update={'signature': delta.signature})
+    if isinstance(delta, BetaInputJSONDelta):
+        json_fragments.append(delta.partial_json)
+    return block
+
+
+def _finalize_streamed_block(block: BetaContentBlock, json_fragments: list[str]) -> BetaContentBlock:
+    if not json_fragments:
+        return block
+    try:
+        parsed_input = json.loads(''.join(json_fragments))
+    except json.JSONDecodeError:
+        return block
+    return block.model_copy(update={'input': parsed_input})
+
+
+def _json_completion_suffix(value: str) -> str | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {'{': '}', '[': ']'}
+
+    for char in value:
+        if escaped:
+            escaped = False
+            continue
+        if char == '\\' and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in pairs.values() and (not stack or stack.pop() != char):
+            return None
+
+    if in_string:
+        return None
+    return ''.join(reversed(stack))
+
+
+def _parse_recoverable_json_object(value: str) -> dict[str, Any] | None:
+    parsed: Any
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        suffix = _json_completion_suffix(value)
+        if not suffix:
+            return None
+        try:
+            parsed = json.loads(value + suffix)
+        except json.JSONDecodeError:
+            return None
+
+    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
+
+
+def _coerce_anthropic_code_execution_tool_input(tool_name: str, input_value: Any) -> str | dict[str, Any] | None:
+    if tool_name not in _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES:
+        return cast(str | dict[str, Any] | None, input_value)
+
+    json_value: str | None = None
+    if isinstance(input_value, str):
+        json_value = input_value
+    elif isinstance(input_value, dict):
+        input_dict = cast(dict[str, Any], input_value)
+        if set(input_dict) == {INVALID_JSON_KEY} and isinstance(input_dict[INVALID_JSON_KEY], str):
+            json_value = input_dict[INVALID_JSON_KEY]
+
+    if json_value is None:
+        return cast(str | dict[str, Any] | None, input_value)
+    return _parse_recoverable_json_object(json_value) or cast(str | dict[str, Any] | None, input_value)
+
+
+def _build_mcp_args_prefix(call_part: NativeToolCallPart) -> str:
+    args = call_part.args
+    if not isinstance(args, dict) or 'tool_args' not in args:
+        raise RuntimeError(
+            f"Expected MCP native tool call args to be a dict containing 'tool_args'; got {type(args).__name__}."
+        )
+
+    preceding_pairs = [
+        f'{json.dumps(key)}:{json.dumps(value, default=str)}' for key, value in args.items() if key != 'tool_args'
+    ]
+    prefix = '{'
+    if preceding_pairs:
+        prefix += ','.join(preceding_pairs) + ','
+    return prefix + f'{json.dumps("tool_args")}:'
+
+
+class _AnthropicPauseTurnContinuationStream:
+    def __init__(
+        self,
+        model: AnthropicModel,
+        initial_response: AsyncIterator[BetaRawMessageStreamEvent],
+        request_kwargs: dict[str, Any],
+        anthropic_messages: list[BetaMessageParam],
+    ) -> None:
+        self._model = model
+        self._response = initial_response
+        self._request_kwargs = request_kwargs
+        self._anthropic_messages = anthropic_messages
+        self._index_offset = 0
+        self._latest_container_id: str | None = None
+        self._entered = False
+        self._iterator: AsyncIterator[BetaRawMessageStreamEvent] | None = None
+
+    async def __aenter__(self) -> _AnthropicPauseTurnContinuationStream:
+        await self._enter_response()
+        self._iterator = self._iterate()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._exit_response(*exc_info)
+
+    def __aiter__(self) -> AsyncIterator[BetaRawMessageStreamEvent]:
+        if self._iterator is None:
+            self._iterator = self._iterate()
+        return self
+
+    async def __anext__(self) -> BetaRawMessageStreamEvent:
+        if self._iterator is None:
+            self._iterator = self._iterate()
+        return await anext(self._iterator)
+
+    async def close(self) -> None:
+        await self._exit_response(None, None, None)
+
+    async def aclose(self) -> None:
+        await self.close()
+
+    async def _enter_response(self) -> None:
+        if self._entered:
+            return
+        enter: Callable[[], Any] | None = getattr(self._response, '__aenter__', None)
+        if enter is not None:
+            await enter()
+        self._entered = True
+
+    async def _exit_response(self, *exc_info: object) -> None:
+        if not self._entered:
+            return
+        exit_: Callable[..., Any] | None = getattr(self._response, '__aexit__', None)
+        try:
+            if exit_ is not None:
+                await exit_(*exc_info)
+        finally:
+            self._entered = False
+
+    async def _continue_response(self, blocks: list[BetaContentBlock], max_seen_index: int) -> None:
+        self._anthropic_messages.append(_assistant_message_param_from_blocks(blocks))
+        self._index_offset += max_seen_index + 1
+        await self._exit_response(None, None, None)
+        if self._latest_container_id:
+            self._request_kwargs['container'] = self._latest_container_id
+        create_message = cast(Any, self._model.client.beta.messages.create)
+        self._response = await create_message(**self._request_kwargs, messages=self._anthropic_messages)
+        await self._enter_response()
+
+    async def _iterate(self) -> AsyncIterator[BetaRawMessageStreamEvent]:
+        await self._enter_response()
+        while True:
+            paused = False
+            max_seen_index = -1
+            current_blocks: dict[int, BetaContentBlock] = {}
+            ordered_indexes: list[int] = []
+            input_json_fragments: dict[int, list[str]] = {}
+
+            async for raw_event in self._response:
+                event = _offset_stream_event_index(raw_event, self._index_offset)
+
+                if isinstance(raw_event, BetaRawMessageStartEvent):
+                    if raw_event.message is None:  # pyright: ignore[reportUnnecessaryComparison]
+                        continue
+                    if raw_event.message.container:
+                        self._latest_container_id = raw_event.message.container.id
+                    yield event
+                elif isinstance(raw_event, BetaRawContentBlockStartEvent):
+                    raw_index = raw_event.index
+                    max_seen_index = max(max_seen_index, raw_index)
+                    ordered_indexes.append(raw_index)
+                    current_blocks[raw_index] = raw_event.content_block
+                    input_json_fragments[raw_index] = []
+                    yield event
+                elif isinstance(raw_event, BetaRawContentBlockDeltaEvent):
+                    raw_index = raw_event.index
+                    if block := current_blocks.get(raw_index):
+                        current_blocks[raw_index] = _apply_stream_delta_to_block(
+                            block, raw_event.delta, input_json_fragments.setdefault(raw_index, [])
+                        )
+                    yield event
+                elif isinstance(raw_event, BetaRawContentBlockStopEvent):
+                    raw_index = raw_event.index
+                    if block := current_blocks.get(raw_index):
+                        current_blocks[raw_index] = _finalize_streamed_block(
+                            block, input_json_fragments.get(raw_index, [])
+                        )
+                    yield event
+                elif isinstance(raw_event, BetaRawMessageDeltaEvent):
+                    if raw_event.delta.container:
+                        self._latest_container_id = raw_event.delta.container.id
+                    if raw_event.delta.stop_reason == 'pause_turn':
+                        paused = True
+                        continue
+                    yield event
+                elif isinstance(raw_event, BetaRawMessageStopEvent) and paused:
+                    blocks = [current_blocks[index] for index in ordered_indexes]
+                    await self._continue_response(blocks, max_seen_index)
+                    break
+                else:
+                    yield event
+            else:
+                return
+
+
 @dataclass
 class AnthropicStreamedResponse(StreamedResponse):
     """Implementation of `StreamedResponse` for Anthropic models."""
@@ -2332,6 +2666,8 @@ class AnthropicStreamedResponse(StreamedResponse):
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         with _map_api_errors(self._model_name):
             current_block: BetaContentBlock | None = None
+            completed_responses_usage: usage.RequestUsage | None = None
+            current_response_usage: usage.RequestUsage | None = None
 
             builtin_tool_calls: dict[str, NativeToolCallPart] = {}
             async for event in self._response:
@@ -2341,7 +2677,16 @@ class AnthropicStreamedResponse(StreamedResponse):
                         # as `BetaRawMessageStartEvent(message=None)`. Skip them entirely so we
                         # don't dereference `event.message.id` / `.container` below.
                         continue
-                    self._usage = _map_usage(event, self._provider_name, self._provider_url, self._model_name)
+                    if current_response_usage is not None:
+                        completed_responses_usage = _merge_request_usage(
+                            completed_responses_usage, current_response_usage
+                        )
+                    current_response_usage = _map_usage(
+                        event, self._provider_name, self._provider_url, self._model_name
+                    )
+                    merged_usage = _merge_request_usage(completed_responses_usage, current_response_usage)
+                    if merged_usage is not None:  # pragma: no branch
+                        self._usage = merged_usage
                     self.provider_response_id = event.message.id
                     if event.message.container:
                         self.provider_details = self.provider_details or {}
@@ -2427,12 +2772,7 @@ class AnthropicStreamedResponse(StreamedResponse):
                         call_part = _map_mcp_server_use_block(current_block, self.provider_name)
                         builtin_tool_calls[call_part.tool_call_id] = call_part
 
-                        args_json = call_part.args_as_json_str()
-                        # Drop the final `{}}` so that we can add tool args deltas
-                        args_json_delta = args_json[:-3]
-                        assert args_json_delta.endswith('"tool_args":'), (
-                            f'Expected {args_json_delta!r} to end in `"tool_args":`'
-                        )
+                        args_json_delta = _build_mcp_args_prefix(call_part)
 
                         yield self._parts_manager.handle_part(
                             vendor_part_id=event.index, part=replace(call_part, args=None)
@@ -2494,9 +2834,12 @@ class AnthropicStreamedResponse(StreamedResponse):
                         pass
 
                 elif isinstance(event, BetaRawMessageDeltaEvent):
-                    self._usage = _map_usage(
-                        event, self._provider_name, self._provider_url, self._model_name, self._usage
+                    current_response_usage = _map_usage(
+                        event, self._provider_name, self._provider_url, self._model_name, current_response_usage
                     )
+                    merged_usage = _merge_request_usage(completed_responses_usage, current_response_usage)
+                    if merged_usage is not None:  # pragma: no branch
+                        self._usage = merged_usage
                     if raw_finish_reason := event.delta.stop_reason:  # pragma: no branch
                         self.provider_details = self.provider_details or {}
                         self.provider_details['finish_reason'] = raw_finish_reason
@@ -2715,7 +3058,8 @@ def _map_code_execution_tool(version: AnthropicCodeExecutionToolVersion) -> Beta
 
 
 def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str) -> NativeToolCallPart:
-    tool_args = cast(dict[str, Any], item.input) or None
+    tool_args = _coerce_anthropic_code_execution_tool_input(item.name, item.input)
+    tool_args = tool_args or None
     if item.name in ('web_search', 'code_execution', 'web_fetch'):
         kind = _BUILTIN_TOOL_KIND_BY_SERVER_TOOL_USE_NAME[item.name]
         part = NativeToolCallPart(
@@ -2733,7 +3077,7 @@ def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str)
         # carried on the typed call part. bm25 emits `{"query": "..."}`, regex emits
         # `{"pattern": "..."}`. The variant goes on `provider_details` so same-provider
         # replay can pick the original tool name back out.
-        normalized_args = _normalize_tool_search_args(tool_args, item.name)
+        normalized_args = _normalize_tool_search_args(cast(dict[str, Any] | None, tool_args), item.name)
         provider_details: dict[str, Any] = {
             'strategy': 'regex' if item.name == 'tool_search_tool_regex' else 'bm25',
             **_anthropic_caller_provider_details(item.caller),

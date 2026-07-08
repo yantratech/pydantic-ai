@@ -24,7 +24,7 @@ from inline_snapshot import snapshot
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import NativeTool
-from pydantic_ai.messages import ModelResponse, UploadedFile
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart, UploadedFile
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.native_tools import CodeExecutionTool
 
@@ -338,3 +338,103 @@ def test_openai_code_execution_files_all_filtered():
     tools = model._get_native_tools(parameters)  # pyright: ignore[reportPrivateUsage]
 
     assert tools == snapshot([{'type': 'code_interpreter', 'container': {'type': 'auto'}}])
+
+
+@pytest.mark.skipif(not openai_imports_successful(), reason='openai not installed')
+async def test_openai_code_execution_file_tool_return_reuses_mounted_file():
+    """Mounted code-execution files returned by tools are described, not re-sent as input files."""
+    model = OpenAIResponsesModel('gpt-5', provider=OpenAIProvider(api_key='mock-api-key'))
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='query_report_to_file',
+                    tool_call_id='call_1',
+                    content=UploadedFile(file_id='file-csv', provider_name='openai'),
+                )
+            ],
+        )
+    ]
+    parameters = ModelRequestParameters(
+        native_tools=[
+            CodeExecutionTool(
+                files=[
+                    UploadedFile(
+                        file_id='file-csv',
+                        provider_name='openai',
+                        media_type='text/csv',
+                        identifier='trade-report.csv',
+                    )
+                ]
+            )
+        ],
+    )
+
+    _, mapped_messages = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages, {}, parameters
+    )
+
+    assert mapped_messages == snapshot(
+        [
+            {
+                'call_id': 'call_1',
+                'output': 'File trade-report.csv (text/csv) is available in the code execution container.',
+                'type': 'function_call_output',
+            }
+        ]
+    )
+
+
+@pytest.mark.skipif(not anthropic_imports_successful(), reason='anthropic not installed')
+async def test_anthropic_code_execution_file_tool_return_reuses_mounted_file():
+    """Mounted code-execution files returned by tools are described, not re-sent as document blocks."""
+    model = AnthropicModel('claude-sonnet-4-6', provider=AnthropicProvider(api_key='mock-api-key'))
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='query_report_to_file',
+                    tool_call_id='call_1',
+                    content=[
+                        {'status': 'ok'},
+                        UploadedFile(
+                            file_id='file-csv',
+                            provider_name='anthropic',
+                            media_type='text/csv',
+                            identifier='trade-report.csv',
+                        ),
+                    ],
+                )
+            ],
+        )
+    ]
+    parameters = ModelRequestParameters(
+        native_tools=[CodeExecutionTool(files=[UploadedFile(file_id='file-csv', provider_name='anthropic')])],
+    )
+
+    _, mapped_messages = await model._map_message(  # pyright: ignore[reportPrivateUsage]
+        messages, parameters, AnthropicModelSettings()
+    )
+
+    assert mapped_messages == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {
+                        'tool_use_id': 'call_1',
+                        'type': 'tool_result',
+                        'content': [
+                            {'text': '{"status":"ok"}', 'type': 'text'},
+                            {
+                                'text': 'File trade-report.csv (text/csv) is available in the code execution container.',
+                                'type': 'text',
+                            },
+                        ],
+                        'is_error': False,
+                    },
+                    {'type': 'container_upload', 'file_id': 'file-csv'},
+                ],
+            }
+        ]
+    )
