@@ -11313,10 +11313,16 @@ async def test_messages_create_continues_pause_turn_with_exact_assistant_content
 
 
 async def test_streaming_pause_turn_continuation_accumulates_usage(allow_model_requests: None):
+    container = BetaContainer(
+        id='cntr_pause',
+        expires_at=datetime.now(timezone.utc),
+        skills=[],
+    )
     first_stream: list[MockRawMessageStreamEvent] = [
         BetaRawMessageStartEvent(
             message=BetaMessage(
                 id='msg_pause',
+                container=container,
                 content=[],
                 model='claude-test',
                 role='assistant',
@@ -11333,7 +11339,7 @@ async def test_streaming_pause_turn_continuation_accumulates_usage(allow_model_r
         ),
         BetaRawContentBlockStopEvent(index=0, type='content_block_stop'),
         BetaRawMessageDeltaEvent(
-            delta=Delta(stop_reason='pause_turn'),
+            delta=Delta(stop_reason='pause_turn', container=container),
             usage=BetaMessageDeltaUsage(output_tokens=2),
             type='message_delta',
         ),
@@ -11380,6 +11386,7 @@ async def test_streaming_pause_turn_continuation_accumulates_usage(allow_model_r
     assert response.provider_response_id == 'msg_final'
     calls = get_mock_chat_completion_kwargs(mock_client)
     assert len(calls) == 2
+    assert calls[1]['container'] == 'cntr_pause'
     assert calls[1]['messages'] == snapshot(
         [
             {'role': 'user', 'content': [{'text': 'hello', 'type': 'text'}]},
