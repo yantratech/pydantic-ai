@@ -1148,9 +1148,10 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         internal_toolsets: list[AbstractToolset[AgentDepsT]] = []
         if output_toolset is not None and output_toolset.buffered_tool_names:
             output_toolset = output_toolset.with_buffered_submit()
-            internal_toolsets.append(
-                _output.BufferedOutputEditorToolset(tuple(output_toolset.buffered_tool_names), output_schema)
+            buffered_tool_names = tuple(
+                name for name in output_toolset.tool_names if name in output_toolset.buffered_tool_names
             )
+            internal_toolsets.append(_output.BufferedOutputEditorToolset(buffered_tool_names, output_schema))
 
         # Build the graph
         graph = _agent_graph.build_agent_graph(self.name, self._deps_type, output_type_)
@@ -1163,6 +1164,10 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             output_retries_used=0,
             run_step=0,
             conversation_id=_agent_graph.resolve_conversation_id(conversation_id, message_history),
+            output_buffers=_output.restore_output_buffers(
+                (message_history or ()) if deferred_tool_results is not None else (),
+                output_toolset.buffered_tool_names if output_toolset is not None else frozenset(),
+            ),
         )
 
         # Build a resolver that computes model settings per-step, in order of precedence: run > agent > model

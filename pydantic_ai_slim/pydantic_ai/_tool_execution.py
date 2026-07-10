@@ -83,7 +83,7 @@ def _buffer_status(tool_name: str, buffer: OutputBufferState, *, status: Literal
         'status': status,
         'tool_name': tool_name,
         'revision': buffer.revision,
-        'buffer': buffer.raw_args,
+        'buffer': deepcopy(buffer.raw_args),
     }
     if buffer.validation_error is not None:
         payload['errors'] = buffer.validation_error.content
@@ -296,7 +296,12 @@ class _ToolCallProcessor(Generic[DepsT, NodeRunEndT], ABC):
                     'Tool call results cannot be matched unambiguously because the message history contains '
                     f'duplicate tool_call_id values: {duplicate_ids}'
                 )
-            result_tool_call_ids = set(self.tool_call_results.keys())
+            handled_output_call_ids = {
+                call.tool_call_id
+                for call, kind in zip(self.tool_calls, call_kinds, strict=True)
+                if kind == 'output' and self.tool_call_results.get(call.tool_call_id) == 'skip'
+            }
+            result_tool_call_ids = set(self.tool_call_results.keys()) - handled_output_call_ids
             eligible_call_ids = {call.tool_call_id for call in eligible_calls}
             if eligible_call_ids != result_tool_call_ids:
                 raise exceptions.UserError(
@@ -379,38 +384,45 @@ class _ToolCallProcessor(Generic[DepsT, NodeRunEndT], ABC):
         return await self._run_unbuffered_output_tool_call(call)
 
     async def _run_buffered_output_tool_call(self, call: _messages.ToolCallPart) -> _OutputCallResult[NodeRunEndT]:
-        if self._is_empty_output_tool_call(call):
-            return await self._submit_buffered_output(call)
-
         raw_args = call.args_as_dict()
-        output_args, submit_as_final = _output.split_buffered_output_args(raw_args)
+        try:
+            output_args, submit_as_final = _output.split_buffered_output_args(raw_args)
+        except exceptions.ModelRetry as e:
+            return self._output_retry_result(
+                call,
+                _messages.RetryPromptPart(
+                    tool_name=call.tool_name,
+                    tool_call_id=call.tool_call_id,
+                    content=e.message,
+                ),
+                args_valid=False,
+                error=e,
+            )
         if submit_as_final and not output_args:
             return await self._submit_buffered_output(call)
 
         buffer = self.ctx.state.output_buffers.setdefault(call.tool_name, OutputBufferState())
-        raw_args = output_args
-        buffer.raw_args = raw_args
+        buffer.raw_args = deepcopy(output_args)
         buffer.revision += 1
 
-        part = await self._validate_buffered_output(call, raw_args, buffer=buffer)
-        if submit_as_final and buffer.validation_error is None:
-            submit_call = dataclasses.replace(call, args=raw_args)
-            return await self._run_unbuffered_output_tool_call(submit_call)
+        part, validated = await self._validate_buffered_output(call, buffer.raw_args, buffer=buffer)
+        if submit_as_final and validated is not None:
+            submit_call = dataclasses.replace(call, args=buffer.raw_args)
+            return await self._execute_validated_output_tool_call(submit_call, validated)
 
         return _OutputCallResult(call=call, args_valid=buffer.validation_error is None, return_part=part)
 
     async def _submit_buffered_output(self, call: _messages.ToolCallPart) -> _OutputCallResult[NodeRunEndT]:
         buffer = self.ctx.state.output_buffers.get(call.tool_name)
         if buffer is None or buffer.raw_args is None:
-            self.output_retries_increment += 1
-            return _OutputCallResult(
-                call=call,
-                args_valid=False,
-                retry_part=_messages.RetryPromptPart(
-                    tool_name=call.tool_name,
-                    tool_call_id=call.tool_call_id,
-                    content=f'No buffered output exists for output tool {call.tool_name!r}.',
+            error = exceptions.ModelRetry(f'No buffered output exists for output tool {call.tool_name!r}.')
+            return self._output_retry_result(
+                call,
+                _messages.RetryPromptPart(
+                    tool_name=call.tool_name, tool_call_id=call.tool_call_id, content=error.message
                 ),
+                args_valid=False,
+                error=error,
             )
 
         submit_call = dataclasses.replace(call, args=buffer.raw_args)
@@ -432,6 +444,12 @@ class _ToolCallProcessor(Generic[DepsT, NodeRunEndT], ABC):
             self.output_retries_increment += 1
             return _OutputCallResult(call=call, args_valid=False, retry_part=validated.validation_error.tool_retry)
 
+        return await self._execute_validated_output_tool_call(call, validated)
+
+    async def _execute_validated_output_tool_call(
+        self, call: _messages.ToolCallPart, validated: ValidatedToolCall[DepsT]
+    ) -> _OutputCallResult[NodeRunEndT]:
+        max_output_retries = self.ctx.deps.max_output_retries
         try:
             result_data: Any = await self.tool_manager.execute_output_tool_call(validated, schema=self.schema)
         except exceptions.UnexpectedModelBehavior as e:
@@ -448,10 +466,11 @@ class _ToolCallProcessor(Generic[DepsT, NodeRunEndT], ABC):
 
     async def _validate_buffered_output(
         self, call: _messages.ToolCallPart, raw_args: dict[str, Any], *, buffer: OutputBufferState
-    ) -> _messages.ToolReturnPart:
+    ) -> tuple[_messages.ToolReturnPart, ValidatedToolCall[DepsT] | None]:
         validation_call = dataclasses.replace(call, args=raw_args)
+        validated: ValidatedToolCall[DepsT] | None = None
         try:
-            await self.tool_manager.validate_output_tool_call(
+            validated = await self.tool_manager.validate_output_tool_call(
                 validation_call, schema=self.schema, wrap_validation_errors=False
             )
         except (ToolRetryError, exceptions.ModelRetry, ValidationError) as e:
@@ -462,11 +481,28 @@ class _ToolCallProcessor(Generic[DepsT, NodeRunEndT], ABC):
             buffer.validation_error = None
             content = _buffer_status(call.tool_name, buffer, status='valid')
 
-        return _messages.ToolReturnPart(tool_name=call.tool_name, content=content, tool_call_id=call.tool_call_id)
+        part = _messages.ToolReturnPart(tool_name=call.tool_name, content=content, tool_call_id=call.tool_call_id)
+        return part, validated
 
-    @staticmethod
-    def _is_empty_output_tool_call(call: _messages.ToolCallPart) -> bool:
-        return call.args in ({}, '', None)
+    def _output_retry_result(
+        self,
+        call: _messages.ToolCallPart,
+        retry_part: _messages.RetryPromptPart,
+        *,
+        args_valid: bool,
+        error: BaseException,
+    ) -> _OutputCallResult[NodeRunEndT]:
+        self.output_retries_increment += 1
+        tool = self.tool_manager.tools.get(call.tool_name) if self.tool_manager.tools else None
+        max_retries = tool.max_retries if tool is not None else self.ctx.deps.max_output_retries
+        tool_manager_ctx = self.tool_manager.ctx
+        assert tool_manager_ctx is not None
+        if tool_manager_ctx.retries.get(call.tool_name, 0) >= max_retries:
+            wrapped = exceptions.UnexpectedModelBehavior(f'Exceeded maximum output retries ({max_retries})')
+            wrapped.__cause__ = error
+            return _OutputCallResult(call=call, args_valid=args_valid, raise_exc=wrapped)
+        self.tool_manager.failed_tools.add(call.tool_name)
+        return _OutputCallResult(call=call, args_valid=args_valid, retry_part=retry_part)
 
     def _emit_winning_output(self, call: _messages.ToolCallPart) -> Iterator[_messages.HandleResponseEvent]:
         """Record the winning output's 'processed' status part and emit its events.

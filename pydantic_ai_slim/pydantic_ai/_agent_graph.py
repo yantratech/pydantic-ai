@@ -516,9 +516,18 @@ async def _prepare_request_parameters(
     # `ToolManager.tools` (and execution lookups) as well as the model's request parameters.
     function_tools: list[ToolDefinition] = []
     output_tools: list[ToolDefinition] = []
+    buffered_tool_names: frozenset[str] = (
+        output_schema.toolset.buffered_tool_names if output_schema.toolset is not None else frozenset()
+    )
     for tool_def in ctx.deps.tool_manager.tool_defs:
         if tool_def.kind == 'output':
-            output_tools.append(tool_def)
+            # Buffered output calls are non-terminal until the graph processes an explicit
+            # `submit_as_final` flag. Mark only the model-facing copy as a function so the raw
+            # streaming layer does not emit a premature FinalResultEvent; ToolManager retains
+            # the real output kind and handles the call through the output pipeline.
+            output_tools.append(
+                replace(tool_def, kind='function') if tool_def.name in buffered_tool_names else tool_def
+            )
         else:
             function_tools.append(tool_def)
 

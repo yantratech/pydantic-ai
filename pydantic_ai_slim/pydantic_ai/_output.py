@@ -16,6 +16,7 @@ from typing_extensions import Self, TypedDict, TypeVar
 from pydantic_ai._utils import get_function_type_hints
 
 from . import _function_schema, _utils, messages as _messages
+from ._json_schema import JsonSchemaTransformer
 from ._run_context import AgentDepsT, OutputBufferState, RunContext
 from .exceptions import ModelRetry, ToolRetryError, UserError
 from .output import (
@@ -81,14 +82,6 @@ _BUFFERED_OUTPUT_SUBMIT_AS_FINAL_SCHEMA: ObjectJsonSchema = {
 _EMPTY_OBJECT_JSON_SCHEMA: ObjectJsonSchema = {
     'type': 'object',
     'properties': {},
-    'additionalProperties': False,
-}
-_BUFFERED_OUTPUT_SUBMIT_ONLY_JSON_SCHEMA: ObjectJsonSchema = {
-    'type': 'object',
-    'properties': {
-        _BUFFERED_OUTPUT_SUBMIT_AS_FINAL_KEY: _BUFFERED_OUTPUT_SUBMIT_AS_FINAL_SCHEMA,
-    },
-    'required': [_BUFFERED_OUTPUT_SUBMIT_AS_FINAL_KEY],
     'additionalProperties': False,
 }
 _EDITOR_ARGS_VALIDATOR = cast(SchemaValidator, TypeAdapter(dict[str, Any]).validator)
@@ -1448,11 +1441,59 @@ def _buffer_status(tool_name: str, buffer: OutputBufferState | None, *, status: 
         'status': status,
         'tool_name': tool_name,
         'revision': buffer.revision if buffer is not None else 0,
-        'buffer': buffer.raw_args if buffer is not None else None,
+        'buffer': deepcopy(buffer.raw_args) if buffer is not None else None,
     }
     if buffer is not None and buffer.validation_error is not None:
         payload['errors'] = buffer.validation_error.content
     return payload
+
+
+def restore_output_buffers(
+    message_history: Sequence[_messages.ModelMessage], buffered_tool_names: frozenset[str]
+) -> dict[str, OutputBufferState]:
+    """Restore the latest model-visible buffer snapshot for deferred run continuation."""
+    buffers: dict[str, OutputBufferState] = {}
+    for message in message_history:
+        if not isinstance(message, _messages.ModelRequest):
+            continue
+        for part in message.parts:
+            if not isinstance(part, _messages.ToolReturnPart) or not isinstance(part.content, dict):
+                continue
+            content = cast(dict[str, Any], cast(Any, part).content)
+            tool_name = content.get('tool_name')
+            revision = content.get('revision')
+            raw_args = content.get('buffer')
+            status = content.get('status')
+            if (
+                not isinstance(tool_name, str)
+                or tool_name not in buffered_tool_names
+                or part.tool_name not in {tool_name, f'read_{tool_name}_buffer', f'patch_{tool_name}_buffer'}
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or not isinstance(raw_args, dict)
+                or status not in {'valid', 'invalid'}
+            ):
+                continue
+            current = buffers.get(tool_name)
+            if current is not None and current.revision > revision:
+                continue
+            errors = content.get('errors')
+            validation_error: _messages.RetryPromptPart | None = None
+            if isinstance(errors, str):
+                validation_error = _messages.RetryPromptPart(tool_name=tool_name, content=errors)
+            elif isinstance(errors, list):
+                try:
+                    error_details = _messages.error_details_ta.validate_python(errors)
+                except ValidationError:
+                    pass
+                else:
+                    validation_error = _messages.RetryPromptPart(tool_name=tool_name, content=error_details)
+            buffers[tool_name] = OutputBufferState(
+                raw_args=deepcopy(cast(dict[str, Any], raw_args)),
+                validation_error=validation_error,
+                revision=revision,
+            )
+    return buffers
 
 
 def split_buffered_output_args(args: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -1462,11 +1503,21 @@ def split_buffered_output_args(args: dict[str, Any]) -> tuple[dict[str, Any], bo
 
     output_args = dict(args)
     submit_as_final = output_args.pop(_BUFFERED_OUTPUT_SUBMIT_AS_FINAL_KEY)
-    return output_args, submit_as_final is True
+    if not isinstance(submit_as_final, bool):
+        raise ModelRetry('Buffered output control field `submit_as_final` must be a boolean.')
+    return output_args, submit_as_final
+
+
+class _BufferedOutputJsonSchemaTransformer(JsonSchemaTransformer):
+    """Make every object in an output schema accept an incomplete draft."""
+
+    def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+        schema.pop('required', None)
+        return schema
 
 
 def _with_buffered_submit_schema(schema: ObjectJsonSchema) -> ObjectJsonSchema:
-    output_schema = deepcopy(schema)
+    output_schema = _BufferedOutputJsonSchemaTransformer(schema).walk()
     properties = output_schema.setdefault('properties', {})
     if _BUFFERED_OUTPUT_SUBMIT_AS_FINAL_KEY in properties:
         raise UserError(
@@ -1474,9 +1525,7 @@ def _with_buffered_submit_schema(schema: ObjectJsonSchema) -> ObjectJsonSchema:
             'Rename the output field or disable buffering for this output tool.'
         )
     properties[_BUFFERED_OUTPUT_SUBMIT_AS_FINAL_KEY] = _BUFFERED_OUTPUT_SUBMIT_AS_FINAL_SCHEMA
-    return {
-        'anyOf': [output_schema, _BUFFERED_OUTPUT_SUBMIT_ONLY_JSON_SCHEMA],
-    }
+    return output_schema
 
 
 def _buffer_validation_error(
@@ -1532,8 +1581,14 @@ def _json_pointer_parent(document: dict[str, Any], parts: list[str], path: str) 
         elif isinstance(parent, list):
             parent_list = cast(list[Any], parent)
             try:
-                parent = parent_list[int(part)]
+                index = int(part)
             except (ValueError, IndexError) as e:
+                raise ModelRetry(f'JSON Patch path {path!r} does not exist.') from e
+            if index < 0:
+                raise ModelRetry(f'JSON Patch path {path!r} does not exist.')
+            try:
+                parent = parent_list[index]
+            except IndexError as e:
                 raise ModelRetry(f'JSON Patch path {path!r} does not exist.') from e
         else:
             raise ModelRetry(f'JSON Patch path {path!r} cannot traverse a non-container value.')
@@ -1750,6 +1805,8 @@ class OutputToolset(AbstractToolset[AgentDepsT]):
             description = description or default_description
             if strict is None:
                 strict = default_strict
+            if buffered and strict:
+                raise UserError('Buffered output is incompatible with strict output-tool schemas.')
 
             processor = ObjectOutputProcessor(output=output, description=description, strict=strict)  # pyright: ignore[reportUnknownArgumentType]
             object_def = processor.object_def
@@ -1829,6 +1886,7 @@ class OutputToolset(AbstractToolset[AgentDepsT]):
                     '`submit_as_final` set to true.'
                 ),
                 parameters_json_schema=_with_buffered_submit_schema(tool_def.parameters_json_schema),
+                strict=False,
             )
             if tool_def.name in self.buffered_tool_names
             else tool_def
