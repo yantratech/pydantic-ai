@@ -47,6 +47,7 @@ def _replace_run_context(
                 # plus the static capability set, so it adds no entropy the two fields above don't.
                 'loaded_capability_ids': sorted(value.loaded_capability_ids),
                 'discovered_tool_names': sorted(value.discovered_tool_names),
+                '_output_buffers': value._output_buffers,  # pyright: ignore[reportPrivateUsage]
             }
 
     return inputs

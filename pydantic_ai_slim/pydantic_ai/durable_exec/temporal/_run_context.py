@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
+from pydantic_ai._run_context import OutputBufferState
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import RunContext
 
@@ -13,11 +15,15 @@ if TYPE_CHECKING:
 AgentDepsT = TypeVar('AgentDepsT', default=object, covariant=True)
 """Type variable for the agent dependencies in `RunContext`."""
 
+_OUTPUT_BUFFERS_ADAPTER: TypeAdapter[dict[str, OutputBufferState] | None] = TypeAdapter(
+    dict[str, OutputBufferState] | None
+)
+
 
 class TemporalRunContext(RunContext[AgentDepsT]):
     """The [`RunContext`][pydantic_ai.tools.RunContext] subclass to use to serialize and deserialize the run context for use inside a Temporal activity.
 
-    By default, only the `deps`, `run_id`, `metadata`, `retries`, `tool_call_id`, `tool_name`, `tool_call_approved`, `tool_call_metadata`, `retry`, `max_retries`, `run_step`, `usage`, `partial_output`, `loaded_capability_ids`, `discovered_tool_names`, and `capability_loaded` attributes will be available.
+    By default, only the `deps`, `run_id`, `metadata`, `retries`, `tool_call_id`, `tool_name`, `tool_call_approved`, `tool_call_metadata`, `retry`, `max_retries`, `run_step`, `usage`, `partial_output`, `loaded_capability_ids`, `discovered_tool_names`, `capability_loaded`, and `_output_buffers` attributes will be available.
 
     The `capabilities` registry is intentionally excluded: it holds live capability objects (toolsets, hooks, callables) that aren't serializable across the activity boundary, like `tool_manager`. As a result `available_capability_ids` (which reads `capabilities`) is unavailable inside an activity, while `available_tool_names` still works via its `discovered_tool_names` fallback.
     To make another attribute available, create a `TemporalRunContext` subclass with a custom `serialize_run_context` class method that returns a dictionary that includes the attribute and pass it to [`TemporalAgent`][pydantic_ai.durable_exec.temporal.TemporalAgent].
@@ -63,11 +69,16 @@ class TemporalRunContext(RunContext[AgentDepsT]):
             'loaded_capability_ids': ctx.loaded_capability_ids,
             'discovered_tool_names': ctx.discovered_tool_names,
             'capability_loaded': ctx.capability_loaded,
+            '_output_buffers': _OUTPUT_BUFFERS_ADAPTER.dump_python(ctx._output_buffers, mode='json'),
         }
 
     @classmethod
     def deserialize_run_context(cls, ctx: dict[str, Any], deps: Any) -> TemporalRunContext[Any]:
         """Deserialize the run context from a `dict[str, Any]`."""
+        ctx = {
+            **ctx,
+            '_output_buffers': _OUTPUT_BUFFERS_ADAPTER.validate_python(ctx.get('_output_buffers')),
+        }
         return cls(**ctx, deps=deps)
 
 

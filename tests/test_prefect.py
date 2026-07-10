@@ -34,6 +34,7 @@ from pydantic_ai import (
     ToolCallPart,
     UserPromptPart,
 )
+from pydantic_ai._run_context import OutputBufferState
 from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.models import create_async_http_client
@@ -1369,6 +1370,49 @@ async def test_cache_policy_empty_inputs():
     )
 
     assert result is None
+
+
+def test_cache_key_includes_output_buffers_deterministically():
+    """Semantically equal buffers share a key, while changed contents fork it.
+
+    Unit test because a cached task result cannot show whether nested mutable state was projected
+    into its key or whether mapping insertion order made that projection unstable.
+    """
+    cache_policy = PrefectAgentInputs()
+    mock_task_ctx = MagicMock()
+
+    def compute_key(output_buffers: dict[str, OutputBufferState]) -> str:
+        ctx = RunContext(
+            deps=None,
+            model=TestModel(),
+            usage=RunUsage(),
+            _output_buffers=output_buffers,
+        )
+        key = cache_policy.compute_key(task_ctx=mock_task_ctx, inputs={'ctx': ctx}, flow_parameters={})
+        assert key is not None
+        return key
+
+    first = compute_key(
+        {
+            'final_report': OutputBufferState(raw_args={'title': 'Draft'}, revision=2),
+            'summary': OutputBufferState(raw_args={'text': 'Overview'}, revision=1),
+        }
+    )
+    reordered = compute_key(
+        {
+            'summary': OutputBufferState(raw_args={'text': 'Overview'}, revision=1),
+            'final_report': OutputBufferState(raw_args={'title': 'Draft'}, revision=2),
+        }
+    )
+    changed = compute_key(
+        {
+            'final_report': OutputBufferState(raw_args={'title': 'Final'}, revision=2),
+            'summary': OutputBufferState(raw_args={'text': 'Overview'}, revision=1),
+        }
+    )
+
+    assert first == reordered
+    assert first != changed
 
 
 def test_cache_key_run_context_projection_is_exhaustive():
