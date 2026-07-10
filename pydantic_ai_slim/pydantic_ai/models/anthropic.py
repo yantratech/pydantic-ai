@@ -808,19 +808,24 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
 
         accumulated_usage = response.usage
         paused_blocks: list[BetaContentBlock] = []
+        latest_container = response.container
         while response.stop_reason == 'pause_turn':
             paused_blocks.extend(response.content)
             anthropic_messages.append(_assistant_message_param_from_blocks(response.content))
             if response.container:
+                latest_container = response.container
                 request_kwargs['container'] = response.container.id
             with _map_api_errors(self.model_name):
                 response = await create_message(**request_kwargs, messages=anthropic_messages)
+            if response.container:
+                latest_container = response.container
             accumulated_usage = _merge_anthropic_usage(accumulated_usage, response.usage)
 
         if paused_blocks:
-            return response.model_copy(
-                update={'content': [*paused_blocks, *response.content], 'usage': accumulated_usage}
-            )
+            update: dict[str, Any] = {'content': [*paused_blocks, *response.content], 'usage': accumulated_usage}
+            if response.container is None and latest_container is not None:
+                update['container'] = latest_container
+            return response.model_copy(update=update)
         if accumulated_usage is response.usage:
             return response
         return response.model_copy(update={'usage': accumulated_usage})
@@ -2438,14 +2443,27 @@ def _apply_stream_delta_to_block(block: BetaContentBlock, delta: Any, json_fragm
         return block.model_copy(update={'signature': delta.signature})
     if isinstance(delta, BetaInputJSONDelta):
         json_fragments.append(delta.partial_json)
+    if isinstance(delta, BetaCompactionContentBlockDelta) and isinstance(block, BetaCompactionBlock):
+        update: dict[str, Any] = {}
+        if delta.content is not None:
+            update['content'] = delta.content
+        if delta.encrypted_content is not None:
+            update['encrypted_content'] = delta.encrypted_content
+        return block.model_copy(update=update) if update else block
+    if isinstance(delta, BetaCitationsDelta) and isinstance(block, BetaTextBlock):
+        return block.model_copy(update={'citations': [*(block.citations or []), delta.citation]})
     return block
 
 
 def _finalize_streamed_block(block: BetaContentBlock, json_fragments: list[str]) -> BetaContentBlock:
     if not json_fragments:
         return block
+    json_value = ''.join(json_fragments)
+    if isinstance(block, BetaServerToolUseBlock) and block.name in _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES:
+        parsed_input = _parse_recoverable_json_object(json_value)
+        return block.model_copy(update={'input': parsed_input}) if parsed_input is not None else block
     try:
-        parsed_input = json.loads(''.join(json_fragments))
+        parsed_input = json.loads(json_value)
     except json.JSONDecodeError:
         return block
     return block.model_copy(update={'input': parsed_input})
@@ -2641,6 +2659,10 @@ class _AnthropicPauseTurnContinuationStream:
                         self._latest_container_id = raw_event.delta.container.id
                     if raw_event.delta.stop_reason == 'pause_turn':
                         paused = True
+                        delta = raw_event.delta.model_copy(
+                            update={'stop_reason': None, 'stop_sequence': None, 'stop_details': None}
+                        )
+                        yield event.model_copy(update={'delta': delta})
                         continue
                     yield event
                 elif isinstance(raw_event, BetaRawMessageStopEvent) and paused:
@@ -2862,17 +2884,24 @@ class AnthropicStreamedResponse(StreamedResponse):
                         )
                         if maybe_event is not None:  # pragma: no branch
                             yield maybe_event
-                    elif isinstance(current_block, BetaServerToolUseBlock) and current_block.name in (
-                        'tool_search_tool_regex',
-                        'tool_search_tool_bm25',
-                    ):
-                        # The streaming start emitted the part with `args=None`; JSON deltas
-                        # have since accumulated as a string. Re-emit with the normalized
-                        # cross-provider `ToolSearchArgs` shape so downstream code (history
-                        # replay, typed-part dispatch) sees the same structure as the
-                        # non-streaming `_process_response` path produces.
+                    elif isinstance(current_block, BetaServerToolUseBlock):
                         existing = self._parts_manager.get_part_by_vendor_id(event.index)
-                        if isinstance(existing, NativeToolSearchCallPart):  # pragma: no branch
+                        if current_block.name in _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES and isinstance(
+                            existing, NativeToolCallPart
+                        ):
+                            args = _coerce_anthropic_code_execution_tool_input(current_block.name, existing.args)
+                            yield self._parts_manager.handle_part(
+                                vendor_part_id=event.index,
+                                part=replace(existing, args=args or None),
+                            )
+                        elif current_block.name in ('tool_search_tool_regex', 'tool_search_tool_bm25') and isinstance(
+                            existing, NativeToolSearchCallPart
+                        ):
+                            # The streaming start emitted the part with `args=None`; JSON deltas
+                            # have since accumulated as a string. Re-emit with the normalized
+                            # cross-provider `ToolSearchArgs` shape so downstream code (history
+                            # replay, typed-part dispatch) sees the same structure as the
+                            # non-streaming `_process_response` path produces.
                             yield self._parts_manager.handle_part(
                                 vendor_part_id=event.index,
                                 part=_finalize_streamed_tool_search_call_part(existing),

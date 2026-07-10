@@ -98,8 +98,12 @@ with try_import() as imports_successful:
     from anthropic.lib.tools import BetaAbstractMemoryTool
     from anthropic.resources.beta import AsyncBeta
     from anthropic.types.beta import (
+        BetaCitationPageLocation,
+        BetaCitationsDelta,
         BetaCodeExecutionResultBlock,
         BetaCodeExecutionToolResultBlock,
+        BetaCompactionBlock,
+        BetaCompactionContentBlockDelta,
         BetaCompactionIterationUsage,
         BetaContentBlock,
         BetaDirectCaller,
@@ -11294,6 +11298,7 @@ async def test_messages_create_continues_pause_turn_with_exact_assistant_content
     )
 
     assert response.content == [*pause_content, *final.content]
+    assert response.container == paused.container
     assert response.usage.input_tokens == 21
     assert response.usage.output_tokens == 5
     calls = get_mock_chat_completion_kwargs(mock_client)
@@ -11381,7 +11386,7 @@ async def test_streaming_pause_turn_continuation_accumulates_usage(allow_model_r
     assert output == 'working done'
     response = message(result.all_messages(), ModelResponse, index=-1)
     assert response.usage == snapshot(
-        RequestUsage(input_tokens=30, output_tokens=4, details={'input_tokens': 30, 'output_tokens': 4})
+        RequestUsage(input_tokens=30, output_tokens=5, details={'input_tokens': 30, 'output_tokens': 5})
     )
     assert response.provider_response_id == 'msg_final'
     calls = get_mock_chat_completion_kwargs(mock_client)
@@ -11391,6 +11396,158 @@ async def test_streaming_pause_turn_continuation_accumulates_usage(allow_model_r
         [
             {'role': 'user', 'content': [{'text': 'hello', 'type': 'text'}]},
             {'role': 'assistant', 'content': [{'text': 'working ', 'type': 'text'}]},
+        ]
+    )
+
+
+async def test_streaming_pause_turn_replays_completed_blocks_and_repairs_code_execution_json(
+    allow_model_requests: None,
+):
+    """A precise paused stream pins replay-only deltas and code-execution JSON repair."""
+    container = BetaContainer(
+        id='cntr_pause',
+        expires_at=datetime.now(timezone.utc),
+        skills=[],
+    )
+    citation = BetaCitationPageLocation(
+        cited_text='Source text',
+        document_index=0,
+        document_title='Report',
+        start_page_number=1,
+        end_page_number=1,
+        type='page_location',
+    )
+    first_stream: list[MockRawMessageStreamEvent] = [
+        BetaRawMessageStartEvent(
+            message=BetaMessage(
+                id='msg_pause',
+                container=container,
+                content=[],
+                model='claude-test',
+                role='assistant',
+                stop_reason=None,
+                type='message',
+                usage=BetaUsage(input_tokens=10, output_tokens=0),
+            ),
+            type='message_start',
+        ),
+        BetaRawContentBlockStartEvent(
+            content_block=BetaTextBlock(text='Source text', type='text'),
+            index=0,
+            type='content_block_start',
+        ),
+        BetaRawContentBlockDeltaEvent(
+            delta=BetaCitationsDelta(citation=citation, type='citations_delta'),
+            index=0,
+            type='content_block_delta',
+        ),
+        BetaRawContentBlockStopEvent(index=0, type='content_block_stop'),
+        BetaRawContentBlockStartEvent(
+            content_block=BetaCompactionBlock(type='compaction'),
+            index=1,
+            type='content_block_start',
+        ),
+        BetaRawContentBlockDeltaEvent(
+            delta=BetaCompactionContentBlockDelta(
+                content='Summary of the conversation.',
+                encrypted_content='encrypted-summary',
+                type='compaction_delta',
+            ),
+            index=1,
+            type='content_block_delta',
+        ),
+        BetaRawContentBlockStopEvent(index=1, type='content_block_stop'),
+        BetaRawContentBlockStartEvent(
+            content_block=_server_tool_use_block('bash_code_execution', {}),
+            index=2,
+            type='content_block_start',
+        ),
+        BetaRawContentBlockDeltaEvent(
+            delta=BetaInputJSONDelta(
+                partial_json='{"command":"create","path":"/workspace/report.txt"',
+                type='input_json_delta',
+            ),
+            index=2,
+            type='content_block_delta',
+        ),
+        BetaRawContentBlockStopEvent(index=2, type='content_block_stop'),
+        BetaRawMessageDeltaEvent(
+            delta=Delta(stop_reason='pause_turn', container=container),
+            usage=BetaMessageDeltaUsage(output_tokens=3),
+            type='message_delta',
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+    second_stream: list[MockRawMessageStreamEvent] = [
+        BetaRawMessageStartEvent(
+            message=BetaMessage(
+                id='msg_final',
+                content=[],
+                model='claude-test',
+                role='assistant',
+                stop_reason=None,
+                type='message',
+                usage=BetaUsage(input_tokens=2, output_tokens=0),
+            ),
+            type='message_start',
+        ),
+        BetaRawContentBlockStartEvent(
+            content_block=BetaTextBlock(text='done', type='text'),
+            index=0,
+            type='content_block_start',
+        ),
+        BetaRawContentBlockStopEvent(index=0, type='content_block_stop'),
+        BetaRawMessageDeltaEvent(
+            delta=Delta(stop_reason='end_turn'),
+            usage=BetaMessageDeltaUsage(output_tokens=1),
+            type='message_delta',
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+    mock_client = MockAnthropic.create_stream_mock([first_stream, second_stream])
+    model = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+
+    async with model.request_stream([], {}, ModelRequestParameters()) as streamed:
+        async for _ in streamed:  # pragma: no branch
+            pass
+        response = streamed.get()
+
+    code_execution_call = next(part for part in response.parts if isinstance(part, NativeToolCallPart))
+    assert code_execution_call.args == {'command': 'create', 'path': '/workspace/report.txt'}
+    calls = get_mock_chat_completion_kwargs(mock_client)
+    assert calls[1]['container'] == 'cntr_pause'
+    assert calls[1]['messages'] == snapshot(
+        [
+            {
+                'role': 'assistant',
+                'content': [
+                    {
+                        'citations': [
+                            {
+                                'cited_text': 'Source text',
+                                'document_index': 0,
+                                'document_title': 'Report',
+                                'end_page_number': 1,
+                                'start_page_number': 1,
+                                'type': 'page_location',
+                            }
+                        ],
+                        'text': 'Source text',
+                        'type': 'text',
+                    },
+                    {
+                        'content': 'Summary of the conversation.',
+                        'encrypted_content': 'encrypted-summary',
+                        'type': 'compaction',
+                    },
+                    {
+                        'id': 'srvtoolu_bash_code_execution',
+                        'input': {'command': 'create', 'path': '/workspace/report.txt'},
+                        'name': 'bash_code_execution',
+                        'type': 'server_tool_use',
+                    },
+                ],
+            }
         ]
     )
 
@@ -11651,13 +11808,6 @@ async def test_anthropic_compaction_in_response(allow_model_requests: None):
 
 async def test_anthropic_compaction_streaming(allow_model_requests: None):
     """Test that BetaCompactionBlock in streaming response is handled correctly."""
-    from anthropic.types.beta import (
-        BetaCompactionBlock,
-        BetaCompactionContentBlockDelta,
-    )
-
-    from pydantic_ai.messages import CompactionPart
-
     stream: list[BetaRawMessageStreamEvent] = [
         BetaRawMessageStartEvent(
             type='message_start',
