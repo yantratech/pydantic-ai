@@ -16,16 +16,18 @@ lives in one file.
 from __future__ import annotations
 
 import json
+from collections import UserDict
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pytest
 from inline_snapshot import snapshot
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import NativeTool
-from pydantic_ai.messages import ModelResponse, UploadedFile
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart, UploadedFile
 from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models._code_execution import replace_code_execution_files_in_tool_returns
 from pydantic_ai.native_tools import CodeExecutionTool
 
 from .conftest import try_import
@@ -338,3 +340,158 @@ def test_openai_code_execution_files_all_filtered():
     tools = model._get_native_tools(parameters)  # pyright: ignore[reportPrivateUsage]
 
     assert tools == snapshot([{'type': 'code_interpreter', 'container': {'type': 'auto'}}])
+
+
+def test_code_execution_file_tool_return_replacement_recurses_and_matches_provider():
+    """Container preservation and same-ID provider collisions are internal traversal contracts."""
+    mounted_file = UploadedFile(
+        file_id='file-shared',
+        provider_name='openai',
+        media_type='text/csv',
+        identifier='trade-report.csv',
+    )
+    foreign_file = UploadedFile(file_id='file-shared', provider_name='anthropic')
+    content: UserDict[str, Any] = UserDict(
+        {
+            'artifacts': (
+                UploadedFile(file_id='file-shared', provider_name='openai'),
+                {'nested': UploadedFile(file_id='file-shared', provider_name='openai')},
+                foreign_file,
+                b'unchanged',
+            ),
+            'status': 'ok',
+        }
+    )
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='query_report_to_file',
+                    tool_call_id='call_1',
+                    content=content,
+                )
+            ],
+        )
+    ]
+
+    updated_messages = replace_code_execution_files_in_tool_returns(
+        messages,
+        [CodeExecutionTool(files=[mounted_file])],
+        'openai',
+    )
+
+    updated_request = updated_messages[0]
+    assert isinstance(updated_request, ModelRequest)
+    updated_part = updated_request.parts[0]
+    assert isinstance(updated_part, ToolReturnPart)
+    raw_content: Any = updated_part.content
+    assert isinstance(raw_content, UserDict)
+    updated_content = cast(UserDict[str, Any], raw_content)
+    artifacts = updated_content['artifacts']
+    assert isinstance(artifacts, tuple)
+    mounted_description = 'File trade-report.csv (text/csv) is available in the code execution container.'
+    assert artifacts[0] == mounted_description
+    assert artifacts[1] == {'nested': mounted_description}
+    assert artifacts[2] == foreign_file
+    assert artifacts[3] == b'unchanged'
+    assert updated_content['status'] == 'ok'
+
+
+@pytest.mark.skipif(not openai_imports_successful(), reason='openai not installed')
+async def test_openai_code_execution_file_tool_return_reuses_mounted_file():
+    """Mounted code-execution files returned by tools are described, not re-sent as input files."""
+    model = OpenAIResponsesModel('gpt-5', provider=OpenAIProvider(api_key='mock-api-key'))
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='query_report_to_file',
+                    tool_call_id='call_1',
+                    content=UploadedFile(file_id='file-csv', provider_name='openai'),
+                )
+            ],
+        )
+    ]
+    parameters = ModelRequestParameters(
+        native_tools=[
+            CodeExecutionTool(
+                files=[
+                    UploadedFile(
+                        file_id='file-csv',
+                        provider_name='openai',
+                        media_type='text/csv',
+                        identifier='trade-report.csv',
+                    )
+                ]
+            )
+        ],
+    )
+
+    _, mapped_messages = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages, {}, parameters
+    )
+
+    assert mapped_messages == snapshot(
+        [
+            {
+                'call_id': 'call_1',
+                'output': 'File trade-report.csv (text/csv) is available in the code execution container.',
+                'type': 'function_call_output',
+            }
+        ]
+    )
+
+
+@pytest.mark.skipif(not anthropic_imports_successful(), reason='anthropic not installed')
+async def test_anthropic_code_execution_file_tool_return_reuses_mounted_file():
+    """Mounted code-execution files returned by tools are described, not re-sent as document blocks."""
+    model = AnthropicModel('claude-sonnet-4-6', provider=AnthropicProvider(api_key='mock-api-key'))
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='query_report_to_file',
+                    tool_call_id='call_1',
+                    content=[
+                        {'status': 'ok'},
+                        UploadedFile(
+                            file_id='file-csv',
+                            provider_name='anthropic',
+                            media_type='text/csv',
+                            identifier='trade-report.csv',
+                        ),
+                    ],
+                )
+            ],
+        )
+    ]
+    parameters = ModelRequestParameters(
+        native_tools=[CodeExecutionTool(files=[UploadedFile(file_id='file-csv', provider_name='anthropic')])],
+    )
+
+    _, mapped_messages = await model._map_message(  # pyright: ignore[reportPrivateUsage]
+        messages, parameters, AnthropicModelSettings()
+    )
+
+    assert mapped_messages == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {
+                        'tool_use_id': 'call_1',
+                        'type': 'tool_result',
+                        'content': [
+                            {'text': '{"status":"ok"}', 'type': 'text'},
+                            {
+                                'text': 'File trade-report.csv (text/csv) is available in the code execution container.',
+                                'type': 'text',
+                            },
+                        ],
+                        'is_error': False,
+                    },
+                    {'file_id': 'file-csv', 'type': 'container_upload'},
+                ],
+            }
+        ]
+    )

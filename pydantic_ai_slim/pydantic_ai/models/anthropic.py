@@ -1,6 +1,7 @@
 from __future__ import annotations as _annotations
 
 import io
+import json
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
 from contextlib import asynccontextmanager, contextmanager
@@ -20,6 +21,7 @@ from .._utils import guard_tool_call_id as _guard_tool_call_id, is_str_dict
 from ..capabilities.abstract import AbstractCapability
 from ..exceptions import ModelAPIError, UserError
 from ..messages import (
+    INVALID_JSON_KEY,
     AudioUrl,
     BinaryContent,
     CachePoint,
@@ -84,6 +86,7 @@ from . import (
     download_item,
     get_user_agent,
 )
+from ._code_execution import replace_code_execution_files_in_tool_returns
 from ._tool_choice import ResolvedToolChoice, resolve_tool_choice
 
 _FINISH_REASON_MAP: dict[BetaStopReason, FinishReason | None] = {
@@ -1067,7 +1070,18 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
         }
         for item in response.content:
             if isinstance(item, BetaTextBlock):
-                items.append(TextPart(content=item.text))
+                provider_details = (
+                    {'citations': [citation.model_dump(mode='json', exclude_none=True) for citation in item.citations]}
+                    if item.citations and response.stop_reason == 'pause_turn'
+                    else None
+                )
+                items.append(
+                    TextPart(
+                        content=item.text,
+                        provider_name=self.system if provider_details else None,
+                        provider_details=provider_details,
+                    )
+                )
             elif isinstance(item, BetaServerToolUseBlock):
                 if item.name not in enabled_server_tool_names and item.id not in server_tool_result_ids:
                     continue
@@ -1100,7 +1114,15 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
                 call_part = builtin_tool_calls.get(item.tool_use_id)
                 items.append(_map_mcp_server_result_block(item, call_part, self.system))
             elif isinstance(item, BetaCompactionBlock):
-                items.append(CompactionPart(content=item.content, provider_name=self.system))
+                items.append(
+                    CompactionPart(
+                        content=item.content,
+                        provider_name=self.system,
+                        provider_details={'encrypted_content': item.encrypted_content}
+                        if item.encrypted_content
+                        else None,
+                    )
+                )
             else:
                 assert isinstance(item, BetaToolUseBlock), f'unexpected item type {type(item)}'
                 items.append(
@@ -1438,6 +1460,9 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
         model_settings: AnthropicModelSettings,
     ) -> tuple[str | list[BetaTextBlockParam], list[BetaMessageParam]]:
         """Just maps a `pydantic_ai.Message` to a `anthropic.types.MessageParam`."""
+        messages = replace_code_execution_files_in_tool_returns(
+            messages, model_request_parameters.native_tools, self.system
+        )
         system_prompt_parts: list[str] = []
         anthropic_messages: list[BetaMessageParam] = []
         # Cross-provider files are dropped silently here, not raised via
@@ -1574,7 +1599,12 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
                 for response_part in m.parts:
                     if isinstance(response_part, TextPart):
                         if response_part.content:
-                            assistant_content_params.append(BetaTextBlockParam(text=response_part.content, type='text'))
+                            block = BetaTextBlockParam(text=response_part.content, type='text')
+                            if response_part.provider_name == self.system and response_part.provider_details:
+                                citations = response_part.provider_details.get('citations')
+                                if isinstance(citations, list):
+                                    block['citations'] = cast(Any, citations)
+                            assistant_content_params.append(block)
                     elif isinstance(response_part, ToolCallPart):
                         tool_use_block_param = BetaToolUseBlockParam(
                             id=_guard_tool_call_id(t=response_part),
@@ -1800,9 +1830,12 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
                                 )
                     elif isinstance(response_part, CompactionPart):
                         if response_part.provider_name == self.system:  # pragma: no branch
-                            assistant_content_params.append(
-                                BetaCompactionBlockParam(content=response_part.content, type='compaction')
-                            )
+                            block = BetaCompactionBlockParam(content=response_part.content, type='compaction')
+                            if response_part.provider_details:
+                                encrypted_content = response_part.provider_details.get('encrypted_content')
+                                if isinstance(encrypted_content, str):
+                                    block['encrypted_content'] = encrypted_content
+                            assistant_content_params.append(block)
                     elif isinstance(response_part, FilePart):  # pragma: no cover
                         # Files generated by models are not sent back to models that don't themselves generate files.
                         pass
@@ -2448,6 +2481,7 @@ class AnthropicStreamedResponse(StreamedResponse):
         with _map_api_errors(self._model_name):
             current_block: BetaContentBlock | None = None
             ignored_server_tool_use_indices: set[int] = set()
+            suspended_text_citations: dict[int, list[dict[str, Any]]] = {}
 
             builtin_tool_calls: dict[str, NativeToolCallPart] = {}
             async for event in self._response:
@@ -2466,8 +2500,14 @@ class AnthropicStreamedResponse(StreamedResponse):
                 elif isinstance(event, BetaRawContentBlockStartEvent):
                     current_block = event.content_block
                     if isinstance(current_block, BetaTextBlock) and current_block.text:
+                        if current_block.citations:
+                            suspended_text_citations[event.index] = [
+                                citation.model_dump(mode='json', exclude_none=True)
+                                for citation in current_block.citations
+                            ]
                         for event_ in self._parts_manager.handle_text_delta(
-                            vendor_part_id=event.index, content=current_block.text
+                            vendor_part_id=event.index,
+                            content=current_block.text,
                         ):
                             yield event_
                     elif isinstance(current_block, BetaThinkingBlock):
@@ -2575,7 +2615,13 @@ class AnthropicStreamedResponse(StreamedResponse):
                     elif isinstance(current_block, BetaCompactionBlock):
                         yield self._parts_manager.handle_part(
                             vendor_part_id=event.index,
-                            part=CompactionPart(content=current_block.content, provider_name=self.provider_name),
+                            part=CompactionPart(
+                                content=current_block.content,
+                                provider_name=self.provider_name,
+                                provider_details={'encrypted_content': current_block.encrypted_content}
+                                if current_block.encrypted_content
+                                else None,
+                            ),
                         )
 
                 elif isinstance(event, BetaRawContentBlockDeltaEvent):
@@ -2608,15 +2654,23 @@ class AnthropicStreamedResponse(StreamedResponse):
                         if maybe_event is not None:  # pragma: no branch
                             yield maybe_event
                     elif isinstance(event.delta, BetaCompactionContentBlockDelta):
-                        if event.delta.content:  # pragma: no branch
-                            # Re-emit part with updated content; replaces the initial block start part
+                        existing = self._parts_manager.get_part_by_vendor_id(event.index)
+                        if isinstance(existing, CompactionPart):  # pragma: no branch
+                            provider_details = dict(existing.provider_details or {})
+                            if event.delta.encrypted_content:
+                                provider_details['encrypted_content'] = event.delta.encrypted_content
                             yield self._parts_manager.handle_part(
                                 vendor_part_id=event.index,
-                                part=CompactionPart(content=event.delta.content, provider_name=self.provider_name),
+                                part=replace(
+                                    existing,
+                                    content=event.delta.content or existing.content,
+                                    provider_details=provider_details or None,
+                                ),
                             )
-                    # TODO(Marcelo): We need to handle citations.
                     elif isinstance(event.delta, BetaCitationsDelta):
-                        pass
+                        suspended_text_citations.setdefault(event.index, []).append(
+                            event.delta.citation.model_dump(mode='json', exclude_none=True)
+                        )
 
                 elif isinstance(event, BetaRawMessageDeltaEvent):
                     self._usage = _map_usage(
@@ -2627,6 +2681,18 @@ class AnthropicStreamedResponse(StreamedResponse):
                         self.provider_details['finish_reason'] = raw_finish_reason
                         self.finish_reason = _FINISH_REASON_MAP.get(raw_finish_reason)
                         self.state = 'suspended' if raw_finish_reason == 'pause_turn' else 'complete'
+                        if raw_finish_reason == 'pause_turn':
+                            for index, citations in suspended_text_citations.items():
+                                existing = self._parts_manager.get_part_by_vendor_id(index)
+                                if isinstance(existing, TextPart):  # pragma: no branch
+                                    yield self._parts_manager.handle_part(
+                                        vendor_part_id=index,
+                                        part=replace(
+                                            existing,
+                                            provider_name=self.provider_name,
+                                            provider_details={'citations': citations},
+                                        ),
+                                    )
                     if event.delta.stop_details is not None:
                         self.provider_details = self.provider_details or {}
                         if event.delta.stop_details.explanation is not None:
@@ -2662,6 +2728,16 @@ class AnthropicStreamedResponse(StreamedResponse):
                                 vendor_part_id=event.index,
                                 part=_finalize_streamed_tool_search_call_part(existing),
                             )
+                    elif isinstance(current_block, BetaServerToolUseBlock) and current_block.name in (
+                        _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES
+                    ):
+                        existing = self._parts_manager.get_part_by_vendor_id(event.index)
+                        if isinstance(existing, NativeToolCallPart):  # pragma: no branch
+                            if args := _repair_anthropic_code_execution_tool_input(existing.args):
+                                yield self._parts_manager.handle_part(
+                                    vendor_part_id=event.index,
+                                    part=replace(existing, args=args),
+                                )
                     current_block = None
                 elif isinstance(event, BetaRawMessageStopEvent):  # pragma: no branch
                     current_block = None
@@ -2842,8 +2918,84 @@ def _map_code_execution_tool(version: AnthropicCodeExecutionToolVersion) -> Beta
             assert_never(version)
 
 
+def _json_completion_suffix(value: str) -> str | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {'{': '}', '[': ']'}
+
+    for char in value:
+        if escaped:
+            escaped = False
+            continue
+        if char == '\\' and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in pairs.values() and (not stack or stack.pop() != char):
+            return None
+
+    if in_string:
+        return None
+    return ''.join(reversed(stack))
+
+
+def _parse_recoverable_json_object(value: str) -> dict[str, Any] | None:
+    parsed: Any
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        suffix = _json_completion_suffix(value)
+        if not suffix:
+            return None
+        try:
+            parsed = json.loads(value + suffix)
+        except json.JSONDecodeError:
+            return None
+
+    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
+
+
+def _coerce_anthropic_code_execution_tool_input(tool_name: str, input_value: Any) -> str | dict[str, Any] | None:
+    if tool_name not in _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES:
+        return cast(str | dict[str, Any] | None, input_value)
+
+    json_value: str | None = None
+    if isinstance(input_value, str):
+        json_value = input_value
+    elif isinstance(input_value, dict):
+        input_dict = cast(dict[str, Any], input_value)
+        if set(input_dict) == {INVALID_JSON_KEY} and isinstance(input_dict[INVALID_JSON_KEY], str):
+            json_value = input_dict[INVALID_JSON_KEY]
+
+    if json_value is None:
+        return cast(str | dict[str, Any] | None, input_value)
+    return _parse_recoverable_json_object(json_value) or cast(str | dict[str, Any] | None, input_value)
+
+
+def _repair_anthropic_code_execution_tool_input(input_value: Any) -> dict[str, Any] | None:
+    if isinstance(input_value, dict):
+        input_dict = cast(dict[str, Any], input_value)
+        if set(input_dict) == {INVALID_JSON_KEY} and isinstance(input_dict[INVALID_JSON_KEY], str):
+            return _parse_recoverable_json_object(input_dict[INVALID_JSON_KEY])
+        return None
+    if not isinstance(input_value, str):
+        return None
+    try:
+        json.loads(input_value)
+    except json.JSONDecodeError:
+        return _parse_recoverable_json_object(input_value)
+    return None
+
+
 def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str) -> NativeToolCallPart:
-    tool_args = cast(dict[str, Any], item.input) or None
+    tool_args = _coerce_anthropic_code_execution_tool_input(item.name, item.input) or None
     if item.name in ('web_search', 'code_execution', 'web_fetch'):
         kind = _BUILTIN_TOOL_KIND_BY_SERVER_TOOL_USE_NAME[item.name]
         part = NativeToolCallPart(
@@ -2861,7 +3013,7 @@ def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str)
         # carried on the typed call part. bm25 emits `{"query": "..."}`, regex emits
         # `{"pattern": "..."}`. The variant goes on `provider_details` so same-provider
         # replay can pick the original tool name back out.
-        normalized_args = _normalize_tool_search_args(tool_args, item.name)
+        normalized_args = _normalize_tool_search_args(cast(dict[str, Any] | None, tool_args), item.name)
         provider_details: dict[str, Any] = {
             'strategy': 'regex' if item.name == 'tool_search_tool_regex' else 'bm25',
             **_anthropic_caller_provider_details(item.caller),

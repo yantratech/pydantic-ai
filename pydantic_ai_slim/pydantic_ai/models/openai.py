@@ -112,6 +112,7 @@ from . import (
     download_item,
     get_user_agent,
 )
+from ._code_execution import replace_code_execution_files_in_tool_returns
 from ._tool_choice import resolve_tool_choice
 
 _OPENAI_BACKGROUND_POLL_INTERVAL = 2.0
@@ -2903,6 +2904,9 @@ class OpenAIResponsesModel(Model[AsyncOpenAI]):
 
         Raw CoT is sent back to improve model performance in multi-turn conversations.
         """
+        messages = replace_code_execution_files_in_tool_returns(
+            messages, model_request_parameters.native_tools, self.system
+        )
         profile = self.profile
         send_item_ids = model_settings.get(
             'openai_send_reasoning_ids', profile.get('openai_supports_encrypted_reasoning_content', False)

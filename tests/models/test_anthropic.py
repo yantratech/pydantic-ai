@@ -55,6 +55,7 @@ from pydantic_ai._utils import PeekableAsyncStream
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UserError
 from pydantic_ai.messages import (
+    INVALID_JSON_KEY,
     CompactionPart,
     InstructionPart,
     ToolSearchCallPart,
@@ -151,6 +152,7 @@ with try_import() as imports_successful:
         AnthropicModel,
         AnthropicModelSettings,
         AnthropicStreamedResponse,
+        _map_server_tool_use_block,  # pyright: ignore[reportPrivateUsage]
         _map_usage,  # pyright: ignore[reportPrivateUsage]
     )
     from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
@@ -11583,36 +11585,98 @@ async def test_anthropic_compaction_beta_header(allow_model_requests: None):
 
 
 async def test_anthropic_compaction_in_response(allow_model_requests: None):
-    """Test that BetaCompactionBlock in API response is mapped to CompactionPart."""
-    from anthropic.types.beta import BetaCompactionBlock
+    """Anthropic citations and encrypted compaction data survive normalized-history replay."""
+    from anthropic.types.beta import BetaCitationPageLocation, BetaCompactionBlock
 
     from pydantic_ai.messages import CompactionPart
 
+    citation = BetaCitationPageLocation(
+        cited_text='Source text',
+        document_index=0,
+        document_title='Report',
+        start_page_number=1,
+        end_page_number=1,
+        type='page_location',
+    )
     c = completion_message(
         [
-            BetaCompactionBlock(content='Summary of prior conversation.', type='compaction'),
-            BetaTextBlock(text='Based on our conversation, here is my response.', type='text'),
+            BetaCompactionBlock(
+                content='Summary of prior conversation.',
+                encrypted_content='encrypted-summary',
+                type='compaction',
+            ),
+            BetaTextBlock(
+                text='Based on our conversation, here is my response.',
+                citations=[citation],
+                type='text',
+            ),
         ],
         BetaUsage(input_tokens=100, output_tokens=20),
     )
+    c.stop_reason = 'pause_turn'
     mock_client = MockAnthropic.create_mock(c)
     m = AnthropicModel('claude-sonnet-4-6', provider=AnthropicProvider(anthropic_client=mock_client))
-    agent = Agent(m)
+    response = m._process_response(  # pyright: ignore[reportPrivateUsage]
+        c, ModelRequestParameters(), AnthropicModelSettings()
+    )
 
-    result = await agent.run('Continue our conversation')
-    assert result.output == 'Based on our conversation, here is my response.'
-
-    response_msgs = [msg for msg in result.all_messages() if isinstance(msg, ModelResponse)]
-    assert len(response_msgs) == 1
-    compaction_parts = [p for p in response_msgs[0].parts if isinstance(p, CompactionPart)]
+    compaction_parts = [p for p in response.parts if isinstance(p, CompactionPart)]
     assert len(compaction_parts) == 1
     assert compaction_parts[0].content == 'Summary of prior conversation.'
     assert compaction_parts[0].provider_name == 'anthropic'
+    assert compaction_parts[0].provider_details == {'encrypted_content': 'encrypted-summary'}
+    text_part = next(p for p in response.parts if isinstance(p, TextPart))
+    assert text_part.provider_details == snapshot(
+        {
+            'citations': [
+                {
+                    'cited_text': 'Source text',
+                    'document_index': 0,
+                    'document_title': 'Report',
+                    'end_page_number': 1,
+                    'start_page_number': 1,
+                    'type': 'page_location',
+                }
+            ]
+        }
+    )
+
+    _, replay = await m._map_message(  # pyright: ignore[reportPrivateUsage]
+        [ModelRequest(parts=[UserPromptPart('Continue our conversation')]), response],
+        ModelRequestParameters(),
+        AnthropicModelSettings(),
+    )
+    assistant_blocks = next(message['content'] for message in replay if message['role'] == 'assistant')
+    assert assistant_blocks == snapshot(
+        [
+            {
+                'content': 'Summary of prior conversation.',
+                'encrypted_content': 'encrypted-summary',
+                'type': 'compaction',
+            },
+            {
+                'citations': [
+                    {
+                        'cited_text': 'Source text',
+                        'document_index': 0,
+                        'document_title': 'Report',
+                        'end_page_number': 1,
+                        'start_page_number': 1,
+                        'type': 'page_location',
+                    }
+                ],
+                'text': 'Based on our conversation, here is my response.',
+                'type': 'text',
+            },
+        ]
+    )
 
 
 async def test_anthropic_compaction_streaming(allow_model_requests: None):
-    """Test that BetaCompactionBlock in streaming response is handled correctly."""
+    """Streaming preserves encrypted compaction, citations, and recoverable code input."""
     from anthropic.types.beta import (
+        BetaCitationPageLocation,
+        BetaCitationsDelta,
         BetaCompactionBlock,
         BetaCompactionContentBlockDelta,
     )
@@ -11635,12 +11699,18 @@ async def test_anthropic_compaction_streaming(allow_model_requests: None):
         BetaRawContentBlockStartEvent(
             type='content_block_start',
             index=0,
-            content_block=BetaCompactionBlock(content='Summary of conversation.', type='compaction'),
+            content_block=BetaCompactionBlock(
+                content='Summary of conversation.', encrypted_content='encrypted-initial', type='compaction'
+            ),
         ),
         BetaRawContentBlockDeltaEvent(
             type='content_block_delta',
             index=0,
-            delta=BetaCompactionContentBlockDelta(content='Updated summary of conversation.', type='compaction_delta'),
+            delta=BetaCompactionContentBlockDelta(
+                content='Updated summary of conversation.',
+                encrypted_content='encrypted-updated',
+                type='compaction_delta',
+            ),
         ),
         BetaRawContentBlockStopEvent(type='content_block_stop', index=0),
         BetaRawContentBlockStartEvent(
@@ -11653,10 +11723,44 @@ async def test_anthropic_compaction_streaming(allow_model_requests: None):
             index=1,
             delta=BetaTextDelta(type='text_delta', text='Here is my response.'),
         ),
+        BetaRawContentBlockDeltaEvent(
+            type='content_block_delta',
+            index=1,
+            delta=BetaCitationsDelta(
+                citation=BetaCitationPageLocation(
+                    cited_text='Source text',
+                    document_index=0,
+                    document_title='Report',
+                    start_page_number=1,
+                    end_page_number=1,
+                    type='page_location',
+                ),
+                type='citations_delta',
+            ),
+        ),
         BetaRawContentBlockStopEvent(type='content_block_stop', index=1),
+        BetaRawContentBlockStartEvent(
+            type='content_block_start',
+            index=2,
+            content_block=BetaServerToolUseBlock.model_construct(
+                id='srvtoolu_bash_code_execution',
+                type='server_tool_use',
+                name='bash_code_execution',
+                input={},
+            ),
+        ),
+        BetaRawContentBlockDeltaEvent(
+            type='content_block_delta',
+            index=2,
+            delta=BetaInputJSONDelta(
+                partial_json='{"command":"create","path":"/workspace/report.txt"',
+                type='input_json_delta',
+            ),
+        ),
+        BetaRawContentBlockStopEvent(type='content_block_stop', index=2),
         BetaRawMessageDeltaEvent(
             type='message_delta',
-            delta=Delta(stop_reason='end_turn'),
+            delta=Delta(stop_reason='pause_turn'),
             usage=BetaMessageDeltaUsage(output_tokens=15),
         ),
         BetaRawMessageStopEvent(type='message_stop'),
@@ -11664,18 +11768,37 @@ async def test_anthropic_compaction_streaming(allow_model_requests: None):
 
     mock_client = MockAnthropic.create_stream_mock(stream)
     m = AnthropicModel('claude-sonnet-4-6', provider=AnthropicProvider(anthropic_client=mock_client))
-    agent = Agent(m)
+    async with m.request_stream(
+        [ModelRequest(parts=[UserPromptPart('Continue')])],
+        {},
+        ModelRequestParameters(native_tools=[CodeExecutionTool()]),
+    ) as streamed:
+        async for _ in streamed:
+            pass
+        response = streamed.get()
 
-    async with agent.run_stream('Continue') as result:
-        output = await result.get_output()
-    assert output == 'Here is my response.'
-
-    response_msgs = [msg for msg in result.all_messages() if isinstance(msg, ModelResponse)]
-    assert len(response_msgs) == 1
-    compaction_parts = [p for p in response_msgs[0].parts if isinstance(p, CompactionPart)]
+    compaction_parts = [p for p in response.parts if isinstance(p, CompactionPart)]
     assert len(compaction_parts) == 1
     assert compaction_parts[0].content == 'Updated summary of conversation.'
     assert compaction_parts[0].provider_name == 'anthropic'
+    assert compaction_parts[0].provider_details == {'encrypted_content': 'encrypted-updated'}
+    text_part = next(p for p in response.parts if isinstance(p, TextPart))
+    assert text_part.provider_details == snapshot(
+        {
+            'citations': [
+                {
+                    'cited_text': 'Source text',
+                    'document_index': 0,
+                    'document_title': 'Report',
+                    'end_page_number': 1,
+                    'start_page_number': 1,
+                    'type': 'page_location',
+                }
+            ]
+        }
+    )
+    code_call = next(p for p in response.parts if isinstance(p, NativeToolCallPart))
+    assert code_call.args == {'command': 'create', 'path': '/workspace/report.txt'}
 
 
 async def test_anthropic_compaction_only_response(allow_model_requests: None):
@@ -11896,6 +12019,43 @@ async def test_pause_turn_continues_run(allow_model_requests: None):
             ),
         ]
     )
+
+
+def _server_tool_use_block(name: str, input_value: Any) -> BetaServerToolUseBlock:
+    return BetaServerToolUseBlock.model_construct(
+        id=f'srvtoolu_{name}',
+        type='server_tool_use',
+        name=name,
+        input=input_value,
+    )
+
+
+def test_anthropic_code_execution_tool_input_coerces_recoverable_json():
+    part = _map_server_tool_use_block(
+        _server_tool_use_block(
+            'bash_code_execution',
+            {INVALID_JSON_KEY: '{"command": "create", "path": "/workspace/messages.json"'},
+        ),
+        'anthropic',
+    )
+
+    assert part.args == {'command': 'create', 'path': '/workspace/messages.json'}
+
+
+def test_anthropic_code_execution_tool_input_preserves_irrecoverable_json():
+    input_value = {INVALID_JSON_KEY: '{"command": "create", "path": "unterminated'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('bash_code_execution', input_value), 'anthropic')
+
+    assert part.args == input_value
+
+
+def test_non_code_execution_native_tool_input_is_unaffected():
+    input_value = {INVALID_JSON_KEY: '{"url": "https://example.com"'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('web_fetch', input_value), 'anthropic')
+
+    assert part.args == input_value
 
 
 async def test_pause_turn_exceeds_max_generation_continuations(allow_model_requests: None):
