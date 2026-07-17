@@ -53,6 +53,7 @@ from pydantic_ai import (
     WebSearchTool,
     WebSearchUserLocation,
 )
+from pydantic_ai._run_context import OutputBufferState
 from pydantic_ai.capabilities import MCP, Capability, Instrumentation, NativeTool, ProcessHistory
 from pydantic_ai.direct import model_request_stream
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
@@ -3450,6 +3451,28 @@ def test_temporal_run_context_serializes_usage_limits():
 
     reconstructed = TemporalRunContext.deserialize_run_context(serialized, deps=None)
     assert reconstructed.usage_limits == ctx.usage_limits
+
+
+async def test_temporal_run_context_serializes_output_buffers():
+    """Buffered output state must retain its typed shape across Temporal's payload boundary."""
+    buffer = OutputBufferState(
+        raw_args={'title': 'Draft', 'sections': [{'heading': 'Overview'}]},
+        validation_error=RetryPromptPart('A required section is missing.', tool_name='final_report'),
+        revision=3,
+    )
+    ctx = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        _output_buffers={'final_report': buffer},
+    )
+
+    serialized = TemporalRunContext.serialize_run_context(ctx)
+    payloads = await pydantic_data_converter.encode([serialized])
+    [decoded] = await pydantic_data_converter.decode(payloads, [dict[str, Any]])
+    reconstructed = TemporalRunContext.deserialize_run_context(decoded, deps=None)
+
+    assert reconstructed._output_buffers == {'final_report': buffer}  # pyright: ignore[reportPrivateUsage]
 
 
 def test_temporal_run_context_serialization_is_exhaustive():
