@@ -360,6 +360,32 @@ print(repr(result.output))
 
 _(This example is complete, it can be run "as is")_
 
+##### Buffered Tool Output
+
+For large structured outputs, you can let the model build an output tool's arguments incrementally before it finalizes the run. Pass `buffered=True` to [`ToolOutput`][pydantic_ai.output.ToolOutput]:
+
+```python {title="buffered_output.py"}
+from pydantic import BaseModel
+
+from pydantic_ai import Agent, ToolOutput
+
+
+class Report(BaseModel):
+    title: str
+    summary: str
+    findings: list[str]
+
+
+agent = Agent(
+    'openai:gpt-5.2',
+    output_type=ToolOutput(Report, buffered=True),
+)
+```
+
+With buffered output enabled for an output tool, a call to that tool with arguments replaces the buffer and returns validation feedback to the model instead of ending the run. The model-facing schema makes structured fields optional and disables strict mode so incomplete drafts can reach Pydantic validation and receive its normal errors. Pydantic AI also exposes generated buffer tools such as `read_final_result_buffer` and `patch_final_result_buffer` so the model can inspect and update the draft with JSON Patch operations.
+
+Only `submit_as_final=True` ends the run. Include it alongside complete output arguments to submit in one call, or call the output tool with only `submit_as_final=True` to submit the current buffer through the normal output validation and processing pipeline. Calling the output tool with `{}` replaces the buffer with an empty draft and returns validation feedback; it does not submit.
+
 #### Native Output
 
 Native Output mode uses a model's native "Structured Outputs" feature (aka "JSON Schema response format"), where the model is forced to only output text matching the provided JSON schema. Note that this is not supported by all models, and sometimes comes with restrictions. For example, [Gemini 3](https://ai.google.dev/gemini-api/docs/structured-output#structured_outputs_with_tools) supports Native Output alongside function and native tools, while earlier Gemini models cannot combine Native Output with function tools.
