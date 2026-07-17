@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Callab
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, Union, cast
 
 import pytest
 from dirty_equals import IsJson
@@ -355,6 +355,664 @@ def test_result_pydantic_model_retry():
         ]
     )
     assert result.all_messages_json().startswith(b'[{"parts":[{"content":"Hello",')
+
+
+def test_buffered_tool_output_patches_and_submits_buffer():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        patch_tool_name = f'patch_{output_tool_name}_buffer'
+
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        output_tool_name,
+                        {'a': 1, 'submit_as_final': True},
+                        tool_call_id='stage-output',
+                    )
+                ]
+            )
+
+        last_message = messages[-1]
+        assert isinstance(last_message, ModelRequest)
+        last_part = last_message.parts[-1]
+        assert isinstance(last_part, ToolReturnPart)
+        if last_part.tool_name == output_tool_name:
+            assert isinstance(last_part.content, dict)
+            content = cast(dict[str, Any], last_part.content)
+            assert content['status'] == 'invalid'
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        patch_tool_name,
+                        {'operations': [{'op': 'add', 'path': '/b', 'value': 'patched'}]},
+                        tool_call_id='patch-output',
+                    )
+                ]
+            )
+
+        assert last_part.tool_name == patch_tool_name
+        assert isinstance(last_part.content, dict)
+        content = cast(dict[str, Any], last_part.content)
+        assert content['status'] == 'valid'
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    agent = Agent(FunctionModel(return_model), output_type=ToolOutput(Foo, buffered=True))
+    validator_calls: list[Foo] = []
+
+    @agent.output_validator
+    def validate_output(output: Foo) -> Foo:
+        validator_calls.append(output)
+        return output
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=1, b='patched')
+    assert validator_calls == [Foo(a=1, b='patched')]
+    assert all(
+        not isinstance(part, RetryPromptPart)
+        for message in result.all_messages()
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    )
+
+
+def test_buffered_tool_output_submits_one_shot():
+    validation_inputs: list[Any] = []
+
+    class CountOutputValidation(AbstractCapability):
+        async def before_output_validate(self, ctx: RunContext, *, output_context: Any, output: Any) -> Any:
+            validation_inputs.append(output)
+            return output
+
+    def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    output_tool_name,
+                    {'a': 1, 'b': 'complete', 'submit_as_final': True},
+                    tool_call_id='submit-output',
+                )
+            ]
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=ToolOutput(Foo, buffered=True),
+        capabilities=[CountOutputValidation()],
+    )
+    validator_calls: list[Foo] = []
+
+    @agent.output_validator
+    def validate_output(output: Foo) -> Foo:
+        validator_calls.append(output)
+        return output
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=1, b='complete')
+    assert validator_calls == [Foo(a=1, b='complete')]
+    assert validation_inputs == [{'a': 1, 'b': 'complete'}]
+    assert [
+        part.content
+        for message in result.all_messages()
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ] == ['Final result processed.']
+
+
+def test_buffered_tool_output_submit_as_final_without_buffer_retries():
+    retry_contents: list[Any] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-empty')]
+            )
+
+        last_message = messages[-1]
+        assert isinstance(last_message, ModelRequest)
+        last_part = last_message.parts[-1]
+        assert isinstance(last_part, RetryPromptPart)
+        retry_contents.append(last_part.content)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    output_tool_name,
+                    {'a': 2, 'b': 'after-retry', 'submit_as_final': True},
+                    tool_call_id='submit-output',
+                )
+            ]
+        )
+
+    agent = Agent(FunctionModel(return_model), output_type=ToolOutput(Foo, buffered=True))
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=2, b='after-retry')
+    assert retry_contents == ["No buffered output exists for output tool 'final_result'."]
+
+
+def test_buffered_tool_output_submit_without_buffer_honors_retry_limit():
+    model_calls = 0
+
+    def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        assert info.output_tools is not None
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {'submit_as_final': True}, tool_call_id='submit-empty')]
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=ToolOutput(Foo, buffered=True),
+        retries={'output': 0},
+    )
+
+    with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum output retries \(0\)'):
+        agent.run_sync('Hello')
+
+    assert model_calls == 1
+
+
+def test_buffered_tool_output_submit_without_buffer_honors_tool_retry_override():
+    model_calls = 0
+
+    def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        assert info.output_tools is not None
+        args = {'submit_as_final': True}
+        if model_calls == 2:
+            args = {'a': 1, 'b': 'complete', 'submit_as_final': True}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args)])
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=ToolOutput(Foo, buffered=True, max_retries=1),
+        retries={'output': 0},
+    )
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=1, b='complete')
+    assert model_calls == 2
+
+
+def test_buffered_tool_output_retries_invalid_submit_flag():
+    retry_contents: list[Any] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        output_tool_name,
+                        {'a': 1, 'b': 'not-staged', 'submit_as_final': 'true'},
+                        tool_call_id='invalid-submit-flag',
+                    )
+                ]
+            )
+
+        last_message = messages[-1]
+        assert isinstance(last_message, ModelRequest)
+        last_part = last_message.parts[-1]
+        assert isinstance(last_part, RetryPromptPart)
+        retry_contents.append(last_part.content)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    output_tool_name,
+                    {'a': 2, 'b': 'complete', 'submit_as_final': True},
+                    tool_call_id='submit-output',
+                )
+            ]
+        )
+
+    agent = Agent(FunctionModel(return_model), output_type=ToolOutput(Foo, buffered=True))
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=2, b='complete')
+    assert retry_contents == ['Buffered output control field `submit_as_final` must be a boolean.']
+
+
+def test_buffered_tool_output_empty_arguments_only_update_buffer():
+    observed_statuses: list[str] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[ToolCallPart(output_tool_name, {'a': 1, 'b': 'initial'}, tool_call_id='stage-output')]
+            )
+
+        last_message = messages[-1]
+        assert isinstance(last_message, ModelRequest)
+        last_part = last_message.parts[-1]
+        assert isinstance(last_part, ToolReturnPart)
+        assert isinstance(last_part.content, dict)
+        status = cast(dict[str, Any], last_part.content)['status']
+        assert isinstance(status, str)
+        observed_statuses.append(status)
+        if len(observed_statuses) == 1:
+            return ModelResponse(parts=[ToolCallPart(output_tool_name, {}, tool_call_id='clear-output')])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    output_tool_name,
+                    {'a': 2, 'b': 'replacement', 'submit_as_final': True},
+                    tool_call_id='submit-output',
+                )
+            ]
+        )
+
+    agent = Agent(FunctionModel(return_model), output_type=ToolOutput(Foo, buffered=True))
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=2, b='replacement')
+    assert observed_statuses == ['valid', 'invalid']
+
+
+def test_buffered_tool_output_status_does_not_alias_internal_buffer():
+    class MutatePatchResult(AbstractCapability):
+        async def after_tool_execute(
+            self,
+            ctx: RunContext,
+            *,
+            call: ToolCallPart,
+            tool_def: ToolDefinition,
+            args: Any,
+            result: Any,
+        ) -> Any:
+            if call.tool_name.startswith('patch_') and isinstance(result, dict):
+                buffer = result.get('buffer')
+                if isinstance(buffer, dict):
+                    buffer['b'] = 'mutated-by-hook'
+            return result
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart(output_tool_name, {'a': 1}, tool_call_id='stage-output')])
+        if len(messages) == 3:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        f'patch_{output_tool_name}_buffer',
+                        {'operations': [{'op': 'add', 'path': '/b', 'value': 'patched'}]},
+                        tool_call_id='patch-output',
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=ToolOutput(Foo, buffered=True),
+        capabilities=[MutatePatchResult()],
+    )
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=1, b='patched')
+
+
+def test_buffered_tool_output_ignores_deferred_tool_requests_output_type():
+    seen_infos: list[AgentInfo] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        seen_infos.append(info)
+        output_tool_name = info.output_tools[0].name
+
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        output_tool_name,
+                        {'a': 1, 'b': 'buffered'},
+                        tool_call_id='stage-output',
+                    )
+                ]
+            )
+
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=[ToolOutput(Foo, buffered=True), DeferredToolRequests],
+    )
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == Foo(a=1, b='buffered')
+    assert seen_infos
+    assert [tool.name for tool in seen_infos[0].output_tools or []] == ['final_result']
+    function_tool_names = {tool.name for tool in seen_infos[0].function_tools}
+    assert 'read_final_result_buffer' in function_tool_names
+    assert 'patch_final_result_buffer' in function_tool_names
+    assert 'read_DeferredToolRequests_buffer' not in function_tool_names
+    assert 'patch_DeferredToolRequests_buffer' not in function_tool_names
+
+
+def test_buffered_tool_output_survives_deferred_tool_continuation():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if not any(
+            isinstance(part, ToolReturnPart) and part.tool_name == 'needs_approval'
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        ):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(output_tool_name, {'a': 1, 'b': 'buffered'}, tool_call_id='stage-output'),
+                    ToolCallPart('needs_approval', {}, tool_call_id='approval'),
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=[ToolOutput(Foo, buffered=True), DeferredToolRequests],
+    )
+
+    @agent.tool_plain(requires_approval=True)
+    def needs_approval() -> str:
+        return 'approved'
+
+    deferred = agent.run_sync('Hello')
+    assert isinstance(deferred.output, DeferredToolRequests)
+    assert [call.tool_call_id for call in deferred.output.approvals] == ['approval']
+
+    result = agent.run_sync(
+        message_history=deferred.all_messages(),
+        deferred_tool_results=DeferredToolResults(approvals={'approval': True}),
+    )
+
+    assert result.output == Foo(a=1, b='buffered')
+
+
+def test_buffered_tool_output_survives_suspended_provider_continuation():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert isinstance(messages[-1], ModelResponse)
+        assert messages[-1].state == 'suspended'
+        assert info.output_tools is not None
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {'submit_as_final': True},
+                    tool_call_id='submit-output',
+                )
+            ],
+            provider_name='function',
+            provider_response_id='completed-response',
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=ToolOutput(Foo, buffered=True),
+    )
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart('Build the output')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    'final_result',
+                    {'a': 1, 'b': 'buffered'},
+                    tool_call_id='stage-output',
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    'final_result',
+                    {
+                        'status': 'valid',
+                        'tool_name': 'final_result',
+                        'revision': 1,
+                        'buffer': {'a': 1, 'b': 'buffered'},
+                    },
+                    tool_call_id='stage-output',
+                )
+            ]
+        ),
+        ModelResponse(
+            parts=[TextPart('Still working')],
+            state='suspended',
+            provider_name='function',
+            provider_response_id='suspended-response',
+        ),
+    ]
+
+    result = agent.run_sync(message_history=message_history)
+
+    assert result.output == Foo(a=1, b='buffered')
+
+
+def test_buffered_tool_output_does_not_leak_into_new_run():
+    second_run = False
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if second_run:
+            return ModelResponse(
+                parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='stale-submit')]
+            )
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[ToolCallPart(output_tool_name, {'a': 1, 'b': 'first-run'}, tool_call_id='stage-output')]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=ToolOutput(Foo, buffered=True),
+        retries={'output': 0},
+    )
+
+    first = agent.run_sync('First')
+    assert first.output == Foo(a=1, b='first-run')
+
+    second_run = True
+    with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum output retries \(0\)'):
+        agent.run_sync('Second', message_history=first.all_messages())
+
+
+class InvoiceOutput(BaseModel):
+    invoice_id: str
+    total: int
+
+
+class EscalationOutput(BaseModel):
+    reason: str
+
+
+def test_buffered_tool_output_inherits_multiple_output_tool_names():
+    seen_infos: list[AgentInfo] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        seen_infos.append(info)
+        output_tool_name = 'final_result_InvoiceOutput'
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        output_tool_name,
+                        {'invoice_id': 'inv-1', 'total': 42},
+                        tool_call_id='stage-output',
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    model = FunctionModel(return_model)
+    agent = Agent(
+        model,
+        output_type=[ToolOutput(InvoiceOutput, buffered=True), EscalationOutput, str],
+    )
+
+    result = agent.run_sync('Hello')
+
+    assert result.output == InvoiceOutput(invoice_id='inv-1', total=42)
+    assert seen_infos
+    output_tools = seen_infos[0].output_tools or []
+    output_tool_names = {tool.name for tool in output_tools}
+    assert output_tool_names == {'final_result_InvoiceOutput', 'final_result_EscalationOutput'}
+    function_tool_names = [tool.name for tool in seen_infos[0].function_tools]
+    assert [name for name in function_tool_names if name.endswith('_buffer')] == [
+        'read_final_result_InvoiceOutput_buffer',
+        'patch_final_result_InvoiceOutput_buffer',
+    ]
+    assert 'read_final_result_EscalationOutput_buffer' not in function_tool_names
+    assert 'patch_final_result_EscalationOutput_buffer' not in function_tool_names
+    invoice_tool = next(tool for tool in output_tools if tool.name == 'final_result_InvoiceOutput')
+    escalation_tool = next(tool for tool in output_tools if tool.name == 'final_result_EscalationOutput')
+    submit_as_final_schema = {
+        'type': 'boolean',
+        'description': 'Set to true to submit these arguments, or the current buffer, as the final output.',
+    }
+    assert invoice_tool.parameters_json_schema['type'] == 'object'
+    assert invoice_tool.parameters_json_schema['properties']['submit_as_final'] == submit_as_final_schema
+    assert 'required' not in invoice_tool.parameters_json_schema
+    assert invoice_tool.strict is False
+    assert 'anyOf' not in escalation_tool.parameters_json_schema
+
+
+class NestedBufferedOutput(BaseModel):
+    items: list[Foo]
+
+
+def test_buffered_tool_output_schema_allows_nested_partial_drafts():
+    seen_schema: dict[str, Any] = {}
+
+    def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        tool = info.output_tools[0]
+        seen_schema.update(tool.parameters_json_schema)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool.name,
+                    {'items': [{'a': 1, 'b': 'complete'}], 'submit_as_final': True},
+                    tool_call_id='submit-output',
+                )
+            ]
+        )
+
+    agent = Agent(FunctionModel(return_model), output_type=ToolOutput(NestedBufferedOutput, buffered=True))
+    result = agent.run_sync('Hello')
+
+    assert result.output == NestedBufferedOutput(items=[Foo(a=1, b='complete')])
+
+    def assert_no_required(schema: Any) -> None:
+        if isinstance(schema, dict):
+            assert 'required' not in schema
+            for value in schema.values():
+                assert_no_required(value)
+        elif isinstance(schema, list):
+            for value in schema:
+                assert_no_required(value)
+
+    assert_no_required(seen_schema)
+
+
+def test_buffered_tool_output_rejects_strict_schema():
+    with pytest.raises(UserError, match='Buffered output is incompatible with strict output-tool schemas'):
+        Agent(TestModel(), output_type=ToolOutput(Foo, strict=True, buffered=True)).run_sync('Hello')
+
+
+def test_buffered_output_json_patch_rejects_negative_intermediate_index():
+    retry_messages: list[Any] = []
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        patch_tool_name = f'patch_{output_tool_name}_buffer'
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        output_tool_name,
+                        {'items': [{'a': 1, 'b': 'initial'}]},
+                        tool_call_id='stage-output',
+                    )
+                ]
+            )
+
+        last_message = messages[-1]
+        assert isinstance(last_message, ModelRequest)
+        last_part = last_message.parts[-1]
+        if isinstance(last_part, ToolReturnPart) and last_part.tool_name == output_tool_name:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        patch_tool_name,
+                        {'operations': [{'op': 'replace', 'path': '/items/-1/b', 'value': 'wrong'}]},
+                        tool_call_id='invalid-patch',
+                    )
+                ]
+            )
+        if isinstance(last_part, RetryPromptPart):
+            retry_messages.append(last_part.content)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        patch_tool_name,
+                        {'operations': [{'op': 'replace', 'path': '/items/0/b', 'value': 'patched'}]},
+                        tool_call_id='valid-patch',
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-output')]
+        )
+
+    agent = Agent(FunctionModel(return_model), output_type=ToolOutput(NestedBufferedOutput, buffered=True))
+    result = agent.run_sync('Hello')
+
+    assert result.output == NestedBufferedOutput(items=[Foo(a=1, b='patched')])
+    assert retry_messages == ["JSON Patch path '/items/-1/b' does not exist."]
+
+
+class ConflictingBufferedOutput(BaseModel):
+    submit_as_final: bool
+
+
+def test_buffered_tool_output_rejects_submit_as_final_field_name():
+    agent = Agent(TestModel(), output_type=ToolOutput(ConflictingBufferedOutput, buffered=True))
+
+    with pytest.raises(UserError, match='Buffered output reserves `submit_as_final`'):
+        agent.run_sync('Hello')
 
 
 def test_result_pydantic_model_validation_error():
