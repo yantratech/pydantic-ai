@@ -70,7 +70,7 @@ from pydantic_ai import (
     WebSearchTool,
     WebSearchUserLocation,
 )
-from pydantic_ai._run_context import AnchoredEvidence
+from pydantic_ai._run_context import AnchoredEvidence, OutputBufferState
 from pydantic_ai._warnings import PydanticAIDeprecationWarning
 from pydantic_ai.agent.abstract import AbstractAgent
 from pydantic_ai.capabilities import (
@@ -4458,6 +4458,26 @@ def test_temporal_run_context_serializes_usage_limits():
 
     reconstructed = TemporalRunContext.deserialize_run_context(serialized, deps=None)
     assert reconstructed.usage_limits == ctx.usage_limits
+
+
+async def test_temporal_run_context_serializes_output_buffers():
+    """Buffered output state must retain its typed shape across Temporal's payload boundary."""
+    buffer = OutputBufferState(
+        raw_args={'title': 'Draft', 'sections': [{'heading': 'Overview'}]},
+        validation_error=RetryPromptPart('A required section is missing.', tool_name='final_report'),
+        revision=3,
+    )
+    ctx = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        _output_buffers={'final_report': buffer},
+    )
+
+    wire = await _serialized_run_context_across_the_wire(ctx)
+    reconstructed = TemporalRunContext.deserialize_run_context(wire, deps=None)
+
+    assert reconstructed._output_buffers == {'final_report': buffer}  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_temporal_run_context_preserves_anchored_evidence():
