@@ -49,7 +49,7 @@ from ._deferred_capabilities import (
     parse_loaded_capabilities,
 )
 from ._instructions import normalize_toolset_instructions
-from ._run_context import AnchoredEvidence, set_current_run_context
+from ._run_context import AnchoredEvidence, OutputBufferState, set_current_run_context
 from .exceptions import ToolRetryError
 
 # `_ContinuationStreamedResponse` is an intentionally-exported member of the private
@@ -341,6 +341,8 @@ class GraphAgentState:
     exposed as the private `_mcp_tool_defs_cache` field. Recreated per run and reconstructed
     identically on durable replay/recovery, which is what keeps the Temporal/DBOS MCP wrappers'
     `get_tools` scheduling replay-deterministic."""
+    output_buffers: dict[str, OutputBufferState] = dataclasses.field(default_factory=dict[str, OutputBufferState])
+    """Private per-run buffers used by buffered output tools."""
 
     def check_incomplete_tool_call(self) -> None:
         """Raise `IncompleteToolCall` if the last model response was truncated mid-tool-call."""
@@ -778,9 +780,18 @@ async def _prepare_request_parameters(
     # `ToolManager.tools` (and execution lookups) as well as the model's request parameters.
     function_tools: list[ToolDefinition] = []
     output_tools: list[ToolDefinition] = []
+    buffered_tool_names: frozenset[str] = (
+        output_schema.toolset.buffered_tool_names if output_schema.toolset is not None else frozenset()
+    )
     for tool_def in ctx.deps.tool_manager.tool_defs:
         if tool_def.kind == 'output':
-            output_tools.append(tool_def)
+            # Buffered output calls are non-terminal until the graph processes an explicit
+            # `submit_as_final` flag. Mark only the model-facing copy as a function so the raw
+            # streaming layer does not emit a premature FinalResultEvent; ToolManager retains
+            # the real output kind and handles the call through the output pipeline.
+            output_tools.append(
+                replace(tool_def, kind='function') if tool_def.name in buffered_tool_names else tool_def
+            )
         else:
             function_tools.append(tool_def)
 
@@ -2365,15 +2376,16 @@ def build_run_context(ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT
         _cancellation=ctx.deps.cancellation,
         _event_stream_buffer=ctx.state.event_stream_buffer,
         _mcp_tool_defs_cache=ctx.state.mcp_tool_defs_cache,
+        _output_buffers=ctx.state.output_buffers,
     )
     validation_context = build_validation_context(ctx.deps.validation_context, run_context)
     # Only `validation_context` may be passed to `replace`: it shallow-copies, preserving the shared
     # identity of the mutable members passed by reference above — `loaded_capability_ids`,
     # `discovered_tool_names`, `pending_messages`, `_cancellation`, `_event_stream_buffer`,
-    # `_mcp_tool_defs_cache` (see the invariant on `GraphAgentDeps.loaded_capability_ids`). Never
-    # add any of them as a `replace` kwarg — forking the object would silently break in-step
-    # capability loads / tool reveals / message enqueues / cancellation / event delivery /
-    # tool-defs caching.
+    # `_mcp_tool_defs_cache`, `_output_buffers` (see the invariant on
+    # `GraphAgentDeps.loaded_capability_ids`). Never add any of them as a `replace` kwarg — forking
+    # the object would silently break in-step capability loads / tool reveals / message enqueues /
+    # cancellation / event delivery / tool-defs caching / buffered output updates.
     run_context = replace(run_context, validation_context=validation_context)
     return run_context
 
