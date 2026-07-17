@@ -1574,6 +1574,59 @@ async def test_streamed_structured_response():
     )
 
 
+async def test_run_stream_buffers_output_until_explicit_submission():
+    model_calls = 0
+
+    async def stream_function(_messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+        nonlocal model_calls
+        model_calls += 1
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        args = {'a': 1, 'b': 'buffered'} if model_calls == 1 else {'submit_as_final': True}
+        yield {0: DeltaToolCall(name=output_tool_name)}
+        yield {0: DeltaToolCall(json_args=json.dumps(args))}
+
+    agent = Agent(FunctionModel(stream_function=stream_function), output_type=ToolOutput(Foo, buffered=True))
+
+    async with agent.run_stream('Hello') as result:
+        output = await result.get_output()
+
+    assert output == Foo(a=1, b='buffered')
+    assert model_calls == 2
+    statuses: list[Any] = []
+    for message in result.all_messages():
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if isinstance(part, ToolReturnPart) and isinstance(part.content, dict):
+                    content = cast(dict[str, Any], cast(Any, part).content)
+                    if 'status' in content:
+                        statuses.append(content['status'])
+    assert statuses == ['valid']
+
+
+async def test_run_stream_submits_buffered_output_one_shot():
+    model_calls = 0
+
+    async def stream_function(_messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+        nonlocal model_calls
+        model_calls += 1
+        assert info.output_tools is not None
+        yield {
+            0: DeltaToolCall(
+                name=info.output_tools[0].name,
+                json_args=json.dumps({'a': 1, 'b': 'complete', 'submit_as_final': True}),
+            )
+        }
+
+    agent = Agent(FunctionModel(stream_function=stream_function), output_type=ToolOutput(Foo, buffered=True))
+
+    async with agent.run_stream('Hello') as result:
+        output = await result.get_output()
+
+    assert output == Foo(a=1, b='complete')
+    assert model_calls == 1
+
+
 async def test_structured_response_iter():
     async def text_stream(_messages: list[ModelMessage], agent_info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
         assert agent_info.output_tools is not None
