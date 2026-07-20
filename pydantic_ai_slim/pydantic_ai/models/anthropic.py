@@ -1,6 +1,7 @@
 from __future__ import annotations as _annotations
 
 import io
+import json
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping
 from contextlib import asynccontextmanager, contextmanager
@@ -22,6 +23,7 @@ from .._utils import guard_tool_call_id as _guard_tool_call_id, is_str_dict
 from ..capabilities.abstract import AbstractCapability
 from ..exceptions import ModelAPIError, UserError
 from ..messages import (
+    INVALID_JSON_KEY,
     AudioUrl,
     BinaryContent,
     CachePoint,
@@ -3431,6 +3433,16 @@ class AnthropicStreamedResponse(StreamedResponse):
                                 vendor_part_id=event.index,
                                 part=_finalize_streamed_tool_search_call_part(existing),
                             )
+                    elif isinstance(current_block, BetaServerToolUseBlock) and current_block.name in (
+                        _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES
+                    ):
+                        existing = self._parts_manager.get_part_by_vendor_id(event.index)
+                        if isinstance(existing, NativeToolCallPart):  # pragma: no branch
+                            if (args := _repair_anthropic_code_execution_tool_input(existing.args)) is not None:
+                                yield self._parts_manager.handle_part(
+                                    vendor_part_id=event.index,
+                                    part=replace(existing, args=args or None),
+                                )
                     current_block = None
                 elif isinstance(event, BetaRawMessageStopEvent):  # pragma: no branch
                     current_block = None
@@ -3621,8 +3633,85 @@ def _map_advisor_tool(tool: AdvisorTool) -> BetaAdvisorTool20260301Param:
     return param
 
 
+def _json_completion_suffix(value: str) -> str | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {'{': '}', '[': ']'}
+
+    for char in value:
+        if escaped:
+            escaped = False
+            continue
+        if char == '\\' and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in pairs.values() and (not stack or stack.pop() != char):
+            return None
+
+    if in_string:
+        return None
+    return ''.join(reversed(stack))
+
+
+def _parse_recoverable_json_object(value: str) -> dict[str, Any] | None:
+    parsed: Any
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        suffix = _json_completion_suffix(value)
+        if not suffix:
+            return None
+        try:
+            parsed = json.loads(value + suffix)
+        except json.JSONDecodeError:
+            return None
+
+    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
+
+
+def _coerce_anthropic_code_execution_tool_input(tool_name: str, input_value: Any) -> str | dict[str, Any] | None:
+    if tool_name not in _ANTHROPIC_CODE_EXECUTION_TOOL_NAMES:
+        return cast(str | dict[str, Any] | None, input_value)
+
+    json_value: str | None = None
+    if isinstance(input_value, str):
+        json_value = input_value
+    elif isinstance(input_value, dict):
+        input_dict = cast(dict[str, Any], input_value)
+        if set(input_dict) == {INVALID_JSON_KEY} and isinstance(input_dict[INVALID_JSON_KEY], str):
+            json_value = input_dict[INVALID_JSON_KEY]
+
+    if json_value is None:
+        return cast(str | dict[str, Any] | None, input_value)
+    repaired = _parse_recoverable_json_object(json_value)
+    return repaired if repaired is not None else cast(str | dict[str, Any] | None, input_value)
+
+
+def _repair_anthropic_code_execution_tool_input(input_value: Any) -> dict[str, Any] | None:
+    if isinstance(input_value, dict):
+        input_dict = cast(dict[str, Any], input_value)
+        if set(input_dict) == {INVALID_JSON_KEY} and isinstance(input_dict[INVALID_JSON_KEY], str):
+            return _parse_recoverable_json_object(input_dict[INVALID_JSON_KEY])
+        return None
+    if not isinstance(input_value, str):
+        return None
+    try:
+        json.loads(input_value)
+    except json.JSONDecodeError:
+        return _parse_recoverable_json_object(input_value)
+    return None
+
+
 def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str) -> NativeToolCallPart:
-    tool_args = cast(dict[str, Any], item.input) or None
+    tool_args = _coerce_anthropic_code_execution_tool_input(item.name, item.input) or None
     if item.name in ('web_search', 'code_execution', 'web_fetch'):
         kind = _BUILTIN_TOOL_KIND_BY_SERVER_TOOL_USE_NAME[item.name]
         part = NativeToolCallPart(
@@ -3640,7 +3729,7 @@ def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str)
         # carried on the typed call part. bm25 emits `{"query": "..."}`, regex emits
         # `{"pattern": "..."}`. The variant goes on `provider_details` so same-provider
         # replay can pick the original tool name back out.
-        normalized_args = _normalize_tool_search_args(tool_args, item.name)
+        normalized_args = _normalize_tool_search_args(cast(dict[str, Any] | None, tool_args), item.name)
         provider_details: dict[str, Any] = {
             'strategy': 'regex' if item.name == 'tool_search_tool_regex' else 'bm25',
             **_anthropic_caller_provider_details(item.caller),
