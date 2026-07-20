@@ -56,6 +56,7 @@ from pydantic_ai._utils import PeekableAsyncStream
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UserError
 from pydantic_ai.messages import (
+    INVALID_JSON_KEY,
     CompactionPart,
     InstructionPart,
     ToolSearchCallPart,
@@ -158,6 +159,7 @@ with try_import() as imports_successful:
         AnthropicModel,
         AnthropicModelSettings,
         AnthropicStreamedResponse,
+        _map_server_tool_use_block,  # pyright: ignore[reportPrivateUsage]
         _map_usage,  # pyright: ignore[reportPrivateUsage]
     )
     from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
@@ -12354,6 +12356,123 @@ async def test_pause_turn_continues_run(allow_model_requests: None):
             ),
         ]
     )
+
+
+def _server_tool_use_block(name: str, input_value: Any) -> BetaServerToolUseBlock:
+    return BetaServerToolUseBlock.model_construct(
+        id=f'srvtoolu_{name}',
+        type='server_tool_use',
+        name=name,
+        input=input_value,
+    )
+
+
+@pytest.mark.parametrize('tool_name', ['code_execution', 'bash_code_execution', 'text_editor_code_execution'])
+@pytest.mark.parametrize(
+    ('input_value', 'expected'),
+    [
+        (
+            {INVALID_JSON_KEY: '{"command": "create", "path": "/workspace/messages.json"'},
+            {'command': 'create', 'path': '/workspace/messages.json'},
+        ),
+        ({INVALID_JSON_KEY: '{'}, None),
+    ],
+)
+def test_anthropic_code_execution_tool_input_repairs_recoverable_json(
+    tool_name: str, input_value: dict[str, str], expected: dict[str, Any] | None
+):
+    part = _map_server_tool_use_block(_server_tool_use_block(tool_name, input_value), 'anthropic')
+
+    assert part.args == expected
+
+
+def test_anthropic_code_execution_tool_input_preserves_irrecoverable_json():
+    input_value = {INVALID_JSON_KEY: '{"command": "create", "path": "unterminated'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('bash_code_execution', input_value), 'anthropic')
+
+    assert part.args == input_value
+
+
+def test_anthropic_code_execution_tool_input_preserves_valid_input():
+    input_value = {'command': 'create', 'path': '/workspace/messages.json'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('bash_code_execution', input_value), 'anthropic')
+
+    assert part.args == input_value
+
+
+def test_non_code_execution_native_tool_input_is_unaffected():
+    input_value = {INVALID_JSON_KEY: '{"url": "https://example.com"'}
+
+    part = _map_server_tool_use_block(_server_tool_use_block('web_fetch', input_value), 'anthropic')
+
+    assert part.args == input_value
+
+
+@pytest.mark.parametrize(
+    ('partial_json', 'expected'),
+    [
+        (
+            '{"command":"create","path":"/workspace/report.txt"',
+            {'command': 'create', 'path': '/workspace/report.txt'},
+        ),
+        ('{', None),
+    ],
+)
+async def test_anthropic_streamed_code_execution_tool_input_repairs_recoverable_json(
+    allow_model_requests: None, partial_json: str, expected: dict[str, Any] | None
+):
+    stream: list[BetaRawMessageStreamEvent] = [
+        BetaRawMessageStartEvent(
+            type='message_start',
+            message=BetaMessage(
+                id='msg_123',
+                model='claude-sonnet-4-6',
+                role='assistant',
+                type='message',
+                content=[],
+                stop_reason=None,
+                usage=BetaUsage(input_tokens=100, output_tokens=0),
+            ),
+        ),
+        BetaRawContentBlockStartEvent(
+            type='content_block_start',
+            index=0,
+            content_block=BetaServerToolUseBlock.model_construct(
+                id='srvtoolu_bash_code_execution',
+                type='server_tool_use',
+                name='bash_code_execution',
+                input={},
+            ),
+        ),
+        BetaRawContentBlockDeltaEvent(
+            type='content_block_delta',
+            index=0,
+            delta=BetaInputJSONDelta(partial_json=partial_json, type='input_json_delta'),
+        ),
+        BetaRawContentBlockStopEvent(type='content_block_stop', index=0),
+        BetaRawMessageDeltaEvent(
+            type='message_delta',
+            delta=Delta(stop_reason='end_turn'),
+            usage=BetaMessageDeltaUsage(output_tokens=15),
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+
+    mock_client = MockAnthropic.create_stream_mock(stream)
+    model = AnthropicModel('claude-sonnet-4-6', provider=AnthropicProvider(anthropic_client=mock_client))
+    async with model.request_stream(
+        [ModelRequest(parts=[UserPromptPart('Continue')])],
+        {},
+        ModelRequestParameters(native_tools=[CodeExecutionTool()]),
+    ) as streamed:
+        async for _ in streamed:
+            pass
+        response = streamed.get()
+
+    call = next(part for part in response.parts if isinstance(part, NativeToolCallPart))
+    assert call.args == expected
 
 
 async def test_pause_turn_exceeds_max_generation_continuations(allow_model_requests: None):
