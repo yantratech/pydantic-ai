@@ -1444,8 +1444,8 @@ async def test_run_stream_buffers_output_until_explicit_submission():
             for part in message.parts:
                 if isinstance(part, ToolReturnPart) and isinstance(part.content, dict):
                     content = cast(dict[str, Any], cast(Any, part).content)
-                    if 'status' in content:
-                        statuses.append(content['status'])
+                    assert 'status' in content
+                    statuses.append(content['status'])
     assert statuses == ['valid']
 
 
