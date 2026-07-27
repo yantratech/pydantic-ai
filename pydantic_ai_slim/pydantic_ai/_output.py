@@ -1674,7 +1674,7 @@ class BufferedOutputEditorToolset(AbstractToolset[AgentDepsT]):
 
     @property
     def id(self) -> str | None:
-        return '<buffered-output-editor>'  # pragma: no cover
+        return '<buffered-output-editor>'
 
     @property
     def label(self) -> str:
