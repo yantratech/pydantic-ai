@@ -677,10 +677,10 @@ def test_buffered_tool_output_status_does_not_alias_internal_buffer():
             args: Any,
             result: Any,
         ) -> Any:
-            if call.tool_name.startswith('patch_') and isinstance(result, dict):
-                buffer = result.get('buffer')
-                if isinstance(buffer, dict):
-                    buffer['b'] = 'mutated-by-hook'
+            assert isinstance(result, dict)
+            buffer = result.get('buffer')
+            assert isinstance(buffer, dict)
+            buffer['b'] = 'mutated-by-hook'
             return result
 
     def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -983,7 +983,7 @@ def test_buffered_tool_output_schema_allows_nested_partial_drafts():
             for value in schema:
                 assert_no_required(value)
 
-    assert_no_required(seen_schema)
+    assert_no_required([seen_schema])
 
 
 def test_buffered_tool_output_rejects_strict_schema():
