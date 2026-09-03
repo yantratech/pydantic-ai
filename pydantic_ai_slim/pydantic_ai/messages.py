@@ -50,6 +50,7 @@ from ._event_registry import (
     keeps_canonical_registration as _keeps_canonical_registration,
     shadowed_envelope_fields as _shadowed_envelope_fields,
     undecorated_field_base as _undecorated_field_base,
+    unknown_event_json_schema as _unknown_event_json_schema,
 )
 from ._instrumentation import redact_binary_content, serialize_any
 from ._utils import generate_tool_call_id as _generate_tool_call_id, now_utc as _now_utc
@@ -4759,6 +4760,14 @@ class UnknownCustomEvent(CustomEvent, _register=False):
     so the mapping is exactly the payload the defining process serialized.
     """
 
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema: pydantic_core.core_schema.CoreSchema,
+        handler: pydantic.GetJsonSchemaHandler,
+    ) -> dict[str, Any]:
+        return _unknown_event_json_schema(core_schema, handler)
+
     def to_payload(self) -> dict[str, Any] | None:
         """The event's payload: the original event's fields, preserved in `data`."""
         return self.data
@@ -4980,6 +4989,14 @@ class UnknownCapabilityEvent(CapabilityEvent, _register=False):
 
     data: dict[str, Any] | None = None
     """The original event's payload fields, or `None` if it had none."""
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema: pydantic_core.core_schema.CoreSchema,
+        handler: pydantic.GetJsonSchemaHandler,
+    ) -> dict[str, Any]:
+        return _unknown_event_json_schema(core_schema, handler)
 
 
 _CAPABILITY_EVENT_ENVELOPE_FIELDS = frozenset(f.name for f in dataclasses.fields(UnknownCapabilityEvent))
