@@ -50,7 +50,6 @@ from ._deferred_capabilities import (
     registered_loaded_capability_ids,
 )
 from ._genai_prices import best_effort_price, fill_response_cost
-from ._instructions import normalize_toolset_instructions
 from ._run_context import (
     AnchoredEvidence,
     EventStreamBuffer,
