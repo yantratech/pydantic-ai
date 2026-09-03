@@ -917,6 +917,17 @@ def test_unknown_event_name_with_payload_degrades():
     )
 
 
+@pytest.mark.parametrize('definition_name', ['UnknownCustomEvent', 'UnknownCapabilityEvent'])
+def test_unknown_event_json_schema_exposes_flattened_payload(definition_name: str):
+    """The schema must preserve arbitrary payload fields emitted beside the event envelope."""
+    schema = pydantic.TypeAdapter[AgentStreamEvent](AgentStreamEvent).json_schema(mode='serialization')
+    unknown_event_schema = schema['$defs'][definition_name]
+    envelope_schema, payload_schema = unknown_event_schema['allOf']
+
+    assert 'data' not in envelope_schema['properties']
+    assert payload_schema == {'type': 'object', 'additionalProperties': {}}
+
+
 def test_unknown_event_name_with_nested_data_preserved():
     """A wire event whose only payload field is named `data` round-trips with that nesting intact.
 
