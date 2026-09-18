@@ -1274,8 +1274,23 @@ class _RequireUrlMediaType:
         for kind in _FILE_URL_KINDS:
             choice = schema['choices'][kind]
             assert isinstance(choice, dict), choice
-            schema['choices'][kind] = pydantic_core.core_schema.chain_schema([cls._names_a_media_type(), choice])
+            schema['choices'][kind] = pydantic_core.core_schema.chain_schema(
+                [cls._names_a_media_type(), choice],
+                ref=f'ToolReturn{kind.title().replace("-", "")}',
+                metadata={'pydantic_js_functions': [cls._url_json_schema]},
+            )
         return schema
+
+    @staticmethod
+    def _url_json_schema(
+        schema: pydantic_core.CoreSchema, handler: pydantic.GetJsonSchemaHandler
+    ) -> pydantic.json_schema.JsonSchemaValue:
+        # A chain normally exposes only its first validation step. Name the complete
+        # URL constraint so OpenAPI's discriminator mapping can reference a schema.
+        assert schema['type'] == 'chain'
+        if handler.mode == 'serialization':
+            return handler(schema['steps'][-1])
+        return {'allOf': [handler(step) for step in schema['steps']]}
 
     @staticmethod
     def _names_a_media_type() -> pydantic_core.CoreSchema:

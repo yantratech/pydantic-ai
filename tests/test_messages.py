@@ -1725,17 +1725,15 @@ def test_user_prompt_multimodal_rehydrates_without_media_type():
 
 
 def test_message_json_schema_keeps_the_multimodal_definitions_intact():
-    """The tool-return gate adds no definition of its own to a generated JSON schema.
+    """Tool-return constraints keep the shared multimodal definitions and prompt references intact.
 
-    It wraps each choice of the `MultiModalContent` union where it stands. Copying the members instead
-    would duplicate them under `$defs`, and two definitions competing for one name make pydantic rename
-    *both* — moving keys that `UserPromptPart` references and that any OpenAPI document generated from
-    `ModelMessage` publishes, for users who never return a file from a tool.
+    Distinct `ToolReturn` definitions describe the stricter URL constraints without competing for
+    names used by `UserPromptPart` and existing OpenAPI consumers.
     """
     defs = ModelMessagesTypeAdapter.json_schema()['$defs']
 
     assert {content_type.__name__ for content_type in MULTI_MODAL_CONTENT_TYPES} <= defs.keys()
-    assert sorted(name for name in defs if 'ImageUrl' in name) == snapshot(['ImageUrl'])
+    assert sorted(name for name in defs if 'ImageUrl' in name) == snapshot(['ImageUrl', 'ToolReturnImageUrl'])
 
 
 # Run out-of-process because `PYDANTIC_DISABLE_PLUGINS` is read once, when pydantic is imported.
@@ -3281,3 +3279,13 @@ def test_post_compaction_window_accepts_a_minimal_sequence():
     assert len(window) == 2
     assert isinstance(window[0], ModelResponse)
     assert isinstance(window[1], ModelRequest)
+
+
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+def test_tool_return_content_url_discriminator_mapping_uses_references(mode: Literal['validation', 'serialization']):
+    """Chained URL validation must still produce OpenAPI-compatible discriminator references."""
+    schema = TypeAdapter(ToolReturnContent).json_schema(mode=mode)
+    multimodal = schema['$defs']['ToolReturnContent']['anyOf'][1]
+    mapping = multimodal['discriminator']['mapping']
+    assert all(isinstance(reference, str) and reference.startswith('#/$defs/') for reference in mapping.values())
+    assert {choice['$ref'] for choice in multimodal['oneOf']} == set(mapping.values())
