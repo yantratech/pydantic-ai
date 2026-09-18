@@ -17,7 +17,7 @@ import functools
 import sys
 import warnings
 from collections.abc import Callable, Mapping
-from typing import Any, Generic, TypeVar, overload
+from typing import Any, Generic, TypeVar, cast, overload
 
 import pydantic
 import pydantic_core
@@ -285,6 +285,28 @@ def event_family_schema(
         choices[tag] = _canonicalizing_schema(handler, event_cls)
     choices[_UNKNOWN_TAG] = unknown_schema
     return pydantic_core.core_schema.tagged_union_schema(choices, discriminator)
+
+
+def unknown_event_json_schema(
+    core_schema: pydantic_core.core_schema.CoreSchema,
+    handler: pydantic.GetJsonSchemaHandler,
+) -> dict[str, Any]:
+    """Describe an unknown event's flattened wire payload instead of its internal `data` field."""
+    schema = handler(core_schema)
+    resolved = handler.resolve_ref_schema(schema)
+    if isinstance(properties := resolved.get('properties'), dict):
+        properties = cast(dict[str, Any], properties)
+        properties.pop('data', None)
+        envelope_schema: dict[str, Any] = {'type': 'object', 'properties': properties}
+        if required := resolved.pop('required', None):
+            envelope_schema['required'] = required
+        resolved.pop('properties')
+        resolved.pop('type', None)
+        # The second object is deliberately separate: some OpenAPI generators discard
+        # `additionalProperties` when an object also declares named properties. An empty schema
+        # means "any JSON value" and keeps the flattened payload intact in generated validators.
+        resolved['allOf'] = [envelope_schema, {'type': 'object', 'additionalProperties': {}}]
+    return schema
 
 
 def _canonicalizing_schema(handler: pydantic.GetCoreSchemaHandler, event_cls: type[Any]) -> Any:

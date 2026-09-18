@@ -139,6 +139,7 @@ def _replace_run_context(
                 # hash it by value; `None` (bare/synthetic context) hashes distinctly.
                 'usage_limits': value.usage_limits,
                 **({'workspace': value.workspace.ref} if value.workspace.ref is not None else {}),
+                '_output_buffers': value._output_buffers,  # pyright: ignore[reportPrivateUsage]
             }
 
     return inputs
