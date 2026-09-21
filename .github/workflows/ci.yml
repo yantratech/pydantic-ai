@@ -285,7 +285,7 @@ jobs:
             echo '::error::Could not find a prior stable release for the API compatibility baseline.'
             exit 1
           fi
-          git fetch --depth=1 origin tag "$release_tag"
+          git fetch --depth=1 https://github.com/pydantic/pydantic-ai.git tag "$release_tag"
           uv run python .github/scripts/check_api_compatibility.py --against "$release_tag"
 
       - run: uv build --all-packages --no-sources
