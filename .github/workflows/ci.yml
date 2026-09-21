@@ -994,7 +994,7 @@ jobs:
   # Note: this should match the `deploy-docs-manual` job in manually-deploy-docs.yml
   deploy-docs:
     needs: [check]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.check.result == 'success' }}
+    if: ${{ !cancelled() && github.repository == 'pydantic/pydantic-ai' && github.ref_type == 'tag' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Generate app token
@@ -1064,7 +1064,7 @@ jobs:
   release:
     name: publish to PyPI
     needs: [release-build]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.release-build.result == 'success' }}
+    if: ${{ !cancelled() && github.repository == 'pydantic/pydantic-ai' && github.ref_type == 'tag' && needs.release-build.result == 'success' }}
     runs-on: ubuntu-latest
 
     environment:
