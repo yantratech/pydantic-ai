@@ -693,7 +693,17 @@ class BedrockConverseModel(Model[BaseClient]):
         self, model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
     ) -> tuple[ModelSettings | None, ModelRequestParameters]:
         settings = merge_model_settings(self.settings, model_settings)
-        if model_request_parameters.output_tools and _is_thinking_enabled(settings, model_request_parameters):
+        # Adaptive thinking can use explicit output tools with automatic tool choice. The agent
+        # still validates the final submission and retries text; _support_tool_forcing keeps
+        # Converse on `auto` and rejects explicitly forced choices. Preserve auto-mode fallbacks.
+        if (
+            model_request_parameters.output_tools
+            and _is_thinking_enabled(settings, model_request_parameters)
+            and not (
+                model_request_parameters.output_mode == 'tool'
+                and self._uses_adaptive_thinking(settings, model_request_parameters)
+            )
+        ):
             if model_request_parameters.output_mode == 'auto':
                 output_mode = 'native' if self.profile.get('supports_json_schema_output', False) else 'prompted'
                 model_request_parameters = replace(model_request_parameters, output_mode=output_mode)
@@ -733,6 +743,18 @@ class BedrockConverseModel(Model[BaseClient]):
             self._drop_unsupported_sampling_settings(filtered)
             prepared_settings = filtered or None
         return prepared_settings, model_request_parameters
+
+    def _uses_adaptive_thinking(
+        self, model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
+    ) -> bool:
+        if not self.profile.get('bedrock_supports_adaptive_thinking', False):
+            return False
+        # Provider fields override unified thinking, matching the outgoing request mapping.
+        settings = model_settings or {}
+        additional_fields = settings.get('bedrock_additional_model_requests_fields')
+        if additional_fields is not None and 'thinking' in additional_fields:
+            return bool(additional_fields['thinking'].get('type') == 'adaptive')
+        return bool(settings.get('thinking', model_request_parameters.thinking))
 
     def _drop_unsupported_sampling_settings(self, model_settings: ModelSettings) -> None:
         """Drop the sampling settings a flagged model rejects, warning like `AnthropicModel` does.
