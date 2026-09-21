@@ -243,9 +243,15 @@ jobs:
           fi
           uv run python .github/scripts/agentic_workflow_guard.py check --changed-file-list /tmp/changed-files.txt
 
-      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+      # pre-commit/action calls actions/cache@v4 internally, which violates Yantra's
+      # full-SHA action policy even when the composite itself is pinned.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          extra_args: --all-files --verbose
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-3.13-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit
+        run: uvx --from pre-commit==4.5.1 pre-commit run --all-files --verbose --show-diff-on-failure
         env:
           SKIP: ${{ needs.classify.outputs.pyright_changed == 'true' && 'no-commit-to-branch' || 'no-commit-to-branch,typecheck' }}
           # The `Makefile` leaves pyright single-process by default, for laptops where a worker
@@ -279,7 +285,7 @@ jobs:
             echo '::error::Could not find a prior stable release for the API compatibility baseline.'
             exit 1
           fi
-          git fetch --depth=1 origin tag "$release_tag"
+          git fetch --depth=1 https://github.com/pydantic/pydantic-ai.git tag "$release_tag"
           uv run python .github/scripts/check_api_compatibility.py --against "$release_tag"
 
       - run: uv build --all-packages --no-sources
@@ -362,9 +368,7 @@ jobs:
         run: uv sync --all-extras --no-extra mcp-tasks --all-packages
 
       - name: Check Markdown files
-        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
-        with:
-          extra_args: --all-files --verbose
+        run: uvx --from pre-commit==4.5.1 pre-commit run --all-files --verbose --show-diff-on-failure
         env:
           SKIP: no-commit-to-branch,format,lint,typecheck,check-cassettes
           UV_NO_SYNC: "1"
@@ -994,7 +998,7 @@ jobs:
   # Note: this should match the `deploy-docs-manual` job in manually-deploy-docs.yml
   deploy-docs:
     needs: [check]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.check.result == 'success' }}
+    if: ${{ !cancelled() && github.repository == 'pydantic/pydantic-ai' && github.ref_type == 'tag' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Generate app token
@@ -1064,7 +1068,7 @@ jobs:
   release:
     name: publish to PyPI
     needs: [release-build]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.release-build.result == 'success' }}
+    if: ${{ !cancelled() && github.repository == 'pydantic/pydantic-ai' && github.ref_type == 'tag' && needs.release-build.result == 'success' }}
     runs-on: ubuntu-latest
 
     environment:

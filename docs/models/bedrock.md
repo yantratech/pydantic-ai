@@ -453,3 +453,16 @@ agent = Agent(model)
 Mantle models are served by Pydantic AI's OpenAI model classes — [`BedrockMantleResponsesModel`][pydantic_ai.models.bedrock_mantle.BedrockMantleResponsesModel] and [`BedrockMantleChatModel`][pydantic_ai.models.bedrock_mantle.BedrockMantleChatModel] — so they accept the same settings as the direct [OpenAI](openai.md) models ([`OpenAIResponsesModelSettings`][pydantic_ai.models.openai.OpenAIResponsesModelSettings] and [`OpenAIChatModelSettings`][pydantic_ai.models.openai.OpenAIChatModelSettings]).
 
 The Converse-route features above — [prompt caching](#prompt-caching), [service tier](#service-tier), and [application inference profiles](#using-aws-application-inference-profiles) — are specific to the Converse API and don't apply to the Mantle route. In particular [`bedrock_service_tier`][pydantic_ai.models.bedrock.BedrockModelSettings.bedrock_service_tier] is a Converse setting; the Mantle models do forward the unified [`service_tier`][pydantic_ai.settings.ModelSettings.service_tier] as the OpenAI parameter of the same name, since they are served by the OpenAI model classes.
+
+## Adaptive thinking with output tools
+
+On Claude models that support adaptive thinking, explicit [`ToolOutput`][pydantic_ai.output.ToolOutput]
+can be combined with `thinking=True` or the provider setting `thinking.type='adaptive'`. This includes
+`ToolOutput(..., buffered=True)`. Bedrock Converse uses automatic tool choice for these requests;
+the agent still requires a validated output-tool submission. Plain text consumes the configured
+output retries and cannot complete a structured-only run. Buffered drafts and edits do not finish
+the run until the model submits a valid buffer with `submit_as_final=True`.
+
+Manual extended thinking retains its output-tool restriction. Explicitly forced tool choices remain
+unsupported with thinking. Automatically selected output modes retain their existing native or
+prompted-output fallback.
