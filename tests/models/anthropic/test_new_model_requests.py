@@ -51,6 +51,36 @@ async def test_claude_request_wire_with_tool_and_effort(allow_model_requests: No
 
 
 @pytest.mark.parametrize('model_name', ['claude-opus-5-5', 'claude-fable-5-1'])
+async def test_claude_function_tool_round_trip(allow_model_requests: None, model_name: str) -> None:
+    from anthropic.types.beta import BetaToolUseBlock
+
+    replies = [
+        completion_message(
+            [BetaToolUseBlock(id='tool-1', input={'query': 'hello'}, name='lookup', type='tool_use')],
+            BetaUsage(input_tokens=5, output_tokens=2),
+        ),
+        completion_message([BetaTextBlock(text='done', type='text')], BetaUsage(input_tokens=8, output_tokens=2)),
+    ]
+    client = MockAnthropic.create_mock(replies)
+    model = AnthropicModel(model_name, provider=AnthropicProvider(anthropic_client=client))
+    agent = Agent(model, model_settings=AnthropicModelSettings(anthropic_thinking={'type': 'adaptive'}))
+    calls: list[str] = []
+
+    @agent.tool_plain
+    def lookup(query: str) -> str:
+        calls.append(query)
+        return 'found'
+
+    result = await agent.run('hello')
+    assert result.output == 'done'
+    assert calls == ['hello']
+    requests = get_mock_chat_completion_kwargs(client)
+    assert [request['model'] for request in requests] == [model_name, model_name]
+    assert requests[1]['tool_choice'] == {'type': 'auto'}
+    assert requests[1]['messages'][-1]['content'][0]['tool_use_id'] == 'tool-1'
+
+
+@pytest.mark.parametrize('model_name', ['claude-opus-5-5', 'claude-fable-5-1'])
 async def test_claude_native_output_request(allow_model_requests: None, model_name: str) -> None:
     response = completion_message(
         [BetaTextBlock(text='{"answer":"ok"}', type='text')], BetaUsage(input_tokens=5, output_tokens=2)

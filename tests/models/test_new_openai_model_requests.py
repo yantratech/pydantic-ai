@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip('openai')
 
-from openai.types.responses import ResponseOutputMessage
+from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage
 from pydantic import BaseModel
 
 from pydantic_ai import Agent
@@ -58,6 +58,51 @@ async def test_gpt6_request_wire_with_tool_and_reasoning(allow_model_requests: N
     assert request['model'] == model_name
     assert request['reasoning'] == {'effort': 'max', 'mode': 'standard'}
     assert any(tool.get('name') == 'lookup' for tool in request['tools'])
+
+
+@pytest.mark.parametrize('model_name', ['gpt-6-sol', 'gpt-6-luna'])
+async def test_gpt6_function_tool_round_trip(allow_model_requests: None, model_name: str) -> None:
+    replies = [
+        response_message(
+            [
+                ResponseFunctionToolCall(
+                    arguments='{"query":"hello"}',
+                    call_id='call_1',
+                    name='lookup',
+                    type='function_call',
+                )
+            ]
+        ),
+        response_message(
+            [
+                ResponseOutputMessage.model_validate(
+                    {
+                        'id': 'output-2',
+                        'content': [{'text': 'done', 'type': 'output_text', 'annotations': []}],
+                        'role': 'assistant',
+                        'status': 'completed',
+                        'type': 'message',
+                    }
+                )
+            ]
+        ),
+    ]
+    client = MockOpenAIResponses.create_mock(replies)
+    model = OpenAIResponsesModel(model_name, provider=OpenAIProvider(openai_client=client))
+    agent = Agent(model)
+    calls: list[str] = []
+
+    @agent.tool_plain
+    def lookup(query: str) -> str:
+        calls.append(query)
+        return 'found'
+
+    result = await agent.run('hello')
+    assert result.output == 'done'
+    assert calls == ['hello']
+    requests = get_mock_responses_kwargs(client)
+    assert [request['model'] for request in requests] == [model_name, model_name]
+    assert {'type': 'function_call_output', 'call_id': 'call_1', 'output': 'found'} in requests[1]['input']
 
 
 @pytest.mark.parametrize('model_name', ['gpt-6-sol', 'gpt-6-luna'])
