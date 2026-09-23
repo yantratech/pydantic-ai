@@ -1039,12 +1039,15 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
             merged.get('thinking'),
             supports_adaptive_thinking=supports_adaptive_thinking,
         )
-        # Tool Output resolves to a forced `tool_choice`, which Anthropic rejects alongside extended
-        # thinking. Adaptive thinking is accepted — but only on models that accept forcing at all;
-        # on the rest, Tool Output could only degrade to a soft `tool_choice='auto'` the model may
-        # ignore, so they keep switching away from it whenever a thinking setting is configured.
+        if thinking_type is None and profile.get('thinking_always_enabled', False):
+            thinking_type = 'adaptive'
+        # Extended thinking rejects output tools. Adaptive models without forced tool choice
+        # prefer native output for automatic schemas, but explicit Tool Output remains valid:
+        # the tool-choice mapper sends `auto` and the agent retries until it gets valid output.
         thinking_blocks_output_tools = thinking_type == 'enabled' or (
-            thinking_type == 'adaptive' and not supports_forced_tool_choice
+            thinking_type == 'adaptive'
+            and not supports_forced_tool_choice
+            and model_request_parameters.output_mode != 'tool'
         )
 
         if model_request_parameters.output_tools and thinking_blocks_output_tools:
@@ -1058,11 +1061,6 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
                 # This would result in `tool_choice=required`, which isn't available here.
                 suggested_output_type = 'NativeOutput' if supports_json_schema_output else 'PromptedOutput'
                 remedy = f'Use `output_type={suggested_output_type}(...)` instead.'
-                if thinking_type == 'adaptive':
-                    raise UserError(
-                        f'{self.model_name!r} does not support output tools when a thinking setting is '
-                        f'configured, because it rejects the forced tool choice they require. {remedy}'
-                    )
                 if supports_adaptive_thinking:
                     remedy += " Alternatively, `anthropic_thinking={'type': 'adaptive'}` supports output tools."
                 raise UserError(
@@ -3115,6 +3113,16 @@ def _extract_usage_details(response_usage: BetaUsage | BetaMessageDeltaUsage) ->
         if isinstance((value := getattr(response_usage, key, None)), int):
             details[key] = value
 
+    # Cache creation has separate five-minute and one-hour rates. Preserve the
+    # provider's split across streaming start/delta events and in OTel details.
+    if (
+        isinstance(response_usage, BetaUsage)
+        and (cache_creation := response_usage.cache_creation)
+        and (cache_creation.ephemeral_5m_input_tokens or cache_creation.ephemeral_1h_input_tokens)
+    ):
+        details['cache_write_5m_tokens'] = cache_creation.ephemeral_5m_input_tokens
+        details['cache_write_1h_tokens'] = cache_creation.ephemeral_1h_input_tokens
+
     # Anthropic bills thinking tokens inside `output_tokens`, so this is a readable subset of the
     # output total rather than an additive one, matching `reasoning_tokens` on OpenAI and
     # `thoughts_tokens` on Google.
@@ -3196,6 +3204,11 @@ def _map_usage(
     # genai-prices reads the web search count from Anthropic's nested wire shape and maps it to `web_searches`.
     if web_search_requests := details.get('web_search_requests'):
         usage_for_extraction['server_tool_use'] = {'web_search_requests': web_search_requests}
+    if 'cache_write_5m_tokens' in details or 'cache_write_1h_tokens' in details:
+        usage_for_extraction['cache_creation'] = {
+            'ephemeral_5m_input_tokens': details.get('cache_write_5m_tokens', 0),
+            'ephemeral_1h_input_tokens': details.get('cache_write_1h_tokens', 0),
+        }
 
     # Note: genai-prices already extracts cache_creation_input_tokens and cache_read_input_tokens
     # from the Anthropic response and maps them to cache_write_tokens and cache_read_tokens
