@@ -12854,6 +12854,7 @@ async def test_anthropic_cache_bedrock_real_api(allow_model_requests: None):
             input_tokens=11470,
             cache_write_tokens=1956,
             cache_write_5m_tokens=1956,
+            cache_write_1h_tokens=0,
             cache_read_tokens=9511,
             output_tokens=44,
             details={
