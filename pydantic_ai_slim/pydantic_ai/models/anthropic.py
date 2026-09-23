@@ -3115,7 +3115,11 @@ def _extract_usage_details(response_usage: BetaUsage | BetaMessageDeltaUsage) ->
 
     # Cache creation has separate five-minute and one-hour rates. Preserve the
     # provider's split across streaming start/delta events and in OTel details.
-    if isinstance(response_usage, BetaUsage) and (cache_creation := response_usage.cache_creation):
+    if (
+        isinstance(response_usage, BetaUsage)
+        and (cache_creation := response_usage.cache_creation)
+        and (cache_creation.ephemeral_5m_input_tokens or cache_creation.ephemeral_1h_input_tokens)
+    ):
         details['cache_write_5m_tokens'] = cache_creation.ephemeral_5m_input_tokens
         details['cache_write_1h_tokens'] = cache_creation.ephemeral_1h_input_tokens
 

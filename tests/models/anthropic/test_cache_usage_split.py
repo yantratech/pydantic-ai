@@ -48,3 +48,23 @@ def test_anthropic_cache_write_duration_survives_usage_mapping(response_usage: B
     assert usage.details['cache_write_1h_tokens'] == 20
     assert usage.opentelemetry_attributes()['gen_ai.usage.details.cache_write_1h_tokens'] == 20
     assert usage.output_tokens == (25 if streamed else 20)
+
+
+def test_zero_cache_creation_does_not_add_duration_details() -> None:
+    response_usage = BetaUsage.model_validate(
+        {
+            'input_tokens': 100,
+            'output_tokens': 20,
+            'cache_creation_input_tokens': 0,
+            'cache_read_input_tokens': 0,
+            'cache_creation': {'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 0},
+        }
+    )
+    usage = _map_usage(
+        BetaMessage.model_construct(usage=response_usage),
+        'anthropic',
+        'https://api.anthropic.com',
+        'claude-opus-5-5',
+    )
+    assert 'cache_write_5m_tokens' not in usage.details
+    assert 'cache_write_1h_tokens' not in usage.details

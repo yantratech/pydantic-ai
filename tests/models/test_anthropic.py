@@ -12738,14 +12738,18 @@ async def test_anthropic_cache_real_api(allow_model_requests: None, anthropic_ap
             input_tokens=1532,
             cache_read_tokens=1111,
             cache_write_tokens=418,
+            cache_write_1h_tokens=0,
             output_tokens=33,
             details={
                 'cache_creation_input_tokens': 418,
                 'cache_read_input_tokens': 1111,
                 'input_tokens': 3,
                 'output_tokens': 33,
+                'cache_write_5m_tokens': 418,
+                'cache_write_1h_tokens': 0,
             },
             requests=1,
+            cache_write_5m_tokens=418,
             cost=Decimal('0.0024048'),
         )
     )
