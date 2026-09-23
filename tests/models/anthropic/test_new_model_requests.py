@@ -10,9 +10,9 @@ from anthropic import omit
 from anthropic.types.beta import BetaTextBlock, BetaUsage
 from pydantic import BaseModel
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, UnexpectedModelBehavior
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
-from pydantic_ai.output import NativeOutput
+from pydantic_ai.output import NativeOutput, ToolOutput
 from pydantic_ai.providers.anthropic import AnthropicProvider
 
 from ..test_anthropic import MockAnthropic, completion_message, get_mock_chat_completion_kwargs
@@ -112,3 +112,34 @@ async def test_claude_stream_request(allow_model_requests: None, model_name: str
     request = get_mock_chat_completion_kwargs(client)[0]
     assert request['model'] == model_name
     assert request['output_config']['effort'] == 'medium'
+
+
+@pytest.mark.parametrize('model_name', ['claude-opus-5-5', 'claude-fable-5-1'])
+async def test_claude_tool_output_stays_mandatory(allow_model_requests: None, model_name: str) -> None:
+    from anthropic.types.beta import BetaToolUseBlock
+
+    reply = completion_message(
+        [BetaToolUseBlock(id='output-1', input={'answer': 'ok'}, name='final_result', type='tool_use')],
+        BetaUsage(input_tokens=5, output_tokens=2),
+    )
+    client = MockAnthropic.create_mock(reply)
+    model = AnthropicModel(model_name, provider=AnthropicProvider(anthropic_client=client))
+    result = await Agent(model, output_type=ToolOutput(Answer)).run('answer')
+    assert result.output.answer == 'ok'
+    request = get_mock_chat_completion_kwargs(client)[0]
+    assert request['tool_choice'] == {'type': 'auto'}
+    assert any(tool['name'] == 'final_result' for tool in request['tools'])
+
+
+@pytest.mark.parametrize('model_name', ['claude-opus-5-5', 'claude-fable-5-1'])
+async def test_claude_tool_output_retries_plain_text(allow_model_requests: None, model_name: str) -> None:
+    replies = [
+        completion_message([BetaTextBlock(text='plain text', type='text')], BetaUsage(input_tokens=5, output_tokens=2))
+        for _ in range(2)
+    ]
+    client = MockAnthropic.create_mock(replies)
+    model = AnthropicModel(model_name, provider=AnthropicProvider(anthropic_client=client))
+    agent = Agent(model, output_type=ToolOutput(Answer), retries=1)
+    with pytest.raises(UnexpectedModelBehavior, match='Exceeded maximum output retries'):
+        await agent.run('answer')
+    assert len(get_mock_chat_completion_kwargs(client)) == 2
