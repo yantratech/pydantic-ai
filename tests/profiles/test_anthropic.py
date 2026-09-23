@@ -457,11 +457,11 @@ def test_model_profile_opus_5_5():
     """Opus 5.5 keeps adaptive thinking on, rejects forcing, and binds thinking."""
     profile = anthropic_model_profile('claude-opus-5-5')
     assert profile is not None
-    assert profile['anthropic_supports_adaptive_thinking'] is True
-    assert profile['anthropic_supports_forced_tool_choice'] is False
-    assert profile['anthropic_binds_thinking_blocks'] is True
-    assert profile['thinking_always_enabled'] is True
-    assert profile['context_window'] == 1_000_000
+    assert profile.get('anthropic_supports_adaptive_thinking') is True
+    assert profile.get('anthropic_supports_forced_tool_choice') is False
+    assert profile.get('anthropic_binds_thinking_blocks') is True
+    assert profile.get('thinking_always_enabled') is True
+    assert profile.get('context_window') == 1_000_000
 
 
 def test_model_profile_sonnet_5():

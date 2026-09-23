@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import pytest
+
+pytest.importorskip('anthropic')
+
 from anthropic.types.beta import BetaMessage, BetaMessageDeltaUsage, BetaUsage
 from anthropic.types.beta.beta_raw_message_delta_event import BetaRawMessageDeltaEvent
 from anthropic.types.beta.beta_raw_message_start_event import BetaRawMessageStartEvent
