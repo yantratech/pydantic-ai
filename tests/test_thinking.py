@@ -792,9 +792,8 @@ class TestAnthropicThinkingOutputToolsConflict:
     """Tool Output resolves to a forced `tool_choice`, which Anthropic rejects alongside extended
     thinking but accepts alongside adaptive thinking, so only the former switches the output mode.
 
-    The exception is a model that rejects forcing outright (`claude-fable-5-1`, `claude-mythos-5-1`):
-    there, Tool Output could only fall back to a soft `tool_choice='auto'` the model may ignore, so
-    adaptive thinking keeps switching away from it too.
+    Models that reject forcing select native output for automatic schemas. Explicit Tool Output
+    keeps mandatory validation and retries while the provider receives `tool_choice='auto'`.
 
     These are pre-request guards, so no request is ever made and there is nothing to record. Real
     model names are used so the shipped profile flags — not hand-built ones — decide each case.
@@ -857,17 +856,28 @@ class TestAnthropicThinkingOutputToolsConflict:
 
         assert resolved_params.output_mode == expected_output_mode
 
+    @pytest.mark.parametrize('model_name', ['claude-fable-5-1', 'claude-opus-5-5'])
+    def test_explicit_tool_output_uses_auto_tool_choice(
+        self,
+        anthropic_api_key: str,
+        output_tool_params: ModelRequestParameters,
+        model_name: str,
+    ):
+        model = AnthropicModel(model_name, provider=AnthropicProvider(api_key=anthropic_api_key))
+        settings = AnthropicModelSettings(anthropic_thinking={'type': 'adaptive'})
+        params = replace(output_tool_params, output_mode='tool', allow_text_output=False)
+
+        prepared_settings, prepared_params = model.prepare_request(settings, params)
+
+        assert prepared_params.output_mode == 'tool'
+        assert prepared_params.allow_text_output is False
+        tools, tool_choice = model._prepare_tools_and_tool_choice(prepared_settings or {}, prepared_params)
+        assert len(tools) == 1
+        assert tool_choice == {'type': 'auto'}
+
     @pytest.mark.parametrize(
         'model_name,anthropic_thinking,expected_message',
         [
-            pytest.param(
-                'claude-fable-5-1',
-                None,
-                "'claude-fable-5-1' does not support output tools when a thinking setting is configured, "
-                'because it rejects the forced tool choice they require. '
-                'Use `output_type=NativeOutput(...)` instead.',
-                id='adaptive_profile_that_cannot_force_names_the_model',
-            ),
             pytest.param(
                 'claude-opus-4-6',
                 {'type': 'enabled', 'budget_tokens': 1024},

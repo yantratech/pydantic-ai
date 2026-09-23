@@ -106,6 +106,15 @@ _REASONING_SUPPORT_BY_PREFIX: dict[str, _ReasoningSupport] = {
     'gpt-6-astra': _ReasoningSupport(
         enabled_by_default=True, can_be_disabled=False, supports_mode=True, supports_context=True
     ),
+    # GPT-6 Sol and Luna default to medium and accept 'none', unlike Astra.
+    # https://developers.openai.com/api/docs/models/gpt-6-sol
+    # https://developers.openai.com/api/docs/models/gpt-6-luna
+    'gpt-6-sol': _ReasoningSupport(
+        enabled_by_default=True, can_be_disabled=True, supports_mode=True, supports_context=False
+    ),
+    'gpt-6-luna': _ReasoningSupport(
+        enabled_by_default=True, can_be_disabled=True, supports_mode=True, supports_context=False
+    ),
     # GPT-5.6 (sol/terra/luna) reasons by default (at 'medium') and accepts `effort='none'` to turn
     # reasoning off (GPT-6 Astra shares `reasoning.mode`). The GPT-5.4, -5.5 and
     # -5.6 families all accept `reasoning.context='all_turns'` (live-verified 2026-07).
@@ -414,7 +423,9 @@ def openai_model_profile(model_name: str) -> ModelProfile:
     # (its responses label messages with `phase`, as recorded in the reasoning-mode cassette) and
     # gpt-6-astra (mainline continuation; not yet live-verified).
     # See https://developers.openai.com/api/docs/guides/prompt-guidance.
-    supports_phase = model_name.startswith(('gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra'))
+    supports_phase = model_name.startswith(
+        ('gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+    )
 
     # The o1-mini model doesn't support the `system` role, so we default to `user`.
     # See https://github.com/pydantic/pydantic-ai/issues/974 for more details.
@@ -431,19 +442,21 @@ def openai_model_profile(model_name: str) -> ModelProfile:
     # verified live; GPT-6 Astra per its model guide's supported tools). Like the other gates in
     # this function, this enumerates known versions rather than matching open-endedly, so a new
     # family must be added here explicitly once confirmed; until then it falls back to local search.
-    supports_tool_search = model_name.startswith(('gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra'))
+    supports_tool_search = model_name.startswith(
+        ('gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+    )
     supported_native_tools = _OPENAI_BASE_BUILTINS | {ToolSearchTool} if supports_tool_search else _OPENAI_BASE_BUILTINS
 
     # Explicit prompt cache breakpoints are supported on gpt-5.6 and later models, on both the
     # Chat Completions and Responses APIs. Like the other gates in this function, this enumerates
     # known versions rather than matching open-endedly.
     # See https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints.
-    supports_prompt_cache_breakpoints = model_name.startswith(('gpt-5.6', 'gpt-6-astra'))
+    supports_prompt_cache_breakpoints = model_name.startswith(('gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'))
     # Structured Outputs (output mode 'native') is only supported with the gpt-4o-mini, gpt-4o-mini-2024-07-18,
     # and gpt-4o-2024-08-06 model snapshots and later. We leave it in here for all models because the
     # `default_structured_output_mode` is `'tool'`, so `native` is only used when the user specifically uses
     # the `NativeOutput` marker, so an error from the API is acceptable.
-    return OpenAIModelProfile(
+    profile = OpenAIModelProfile(
         json_schema_transformer=OpenAIJsonSchemaTransformer,
         supports_json_schema_output=True,
         supports_json_object_output=True,
@@ -461,9 +474,14 @@ def openai_model_profile(model_name: str) -> ModelProfile:
         openai_responses_supports_reasoning_context=reasoning.supports_context,
         openai_supports_phase=supports_phase,
         openai_supports_prompt_cache_breakpoints=supports_prompt_cache_breakpoints,
-        openai_supports_minimal_reasoning_effort=not model_name.startswith(('gpt-5.6', 'gpt-6-astra')),
+        openai_supports_minimal_reasoning_effort=not model_name.startswith(
+            ('gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+        ),
         supported_native_tools=supported_native_tools,
     )
+    if model_name.startswith(('gpt-6-sol', 'gpt-6-luna')):
+        profile['context_window'] = 1_050_000
+    return profile
 
 
 def openai_realtime_model_profile(model_name: str) -> RealtimeModelProfile:

@@ -359,6 +359,7 @@ def test_model_profile_fable_5():
     ('model_name', 'supports_forcing'),
     [
         ('claude-fable-5-1', False),
+        ('claude-opus-5-5', False),
         ('claude-mythos-5-1', False),
         ('claude-fable-5', True),
         ('claude-mythos-5', True),
@@ -436,6 +437,8 @@ def test_model_profile_fable_5_1():
             'anthropic_supports_task_budgets': True,
             'anthropic_supports_forced_tool_choice': False,
             'anthropic_binds_thinking_blocks': True,
+            'thinking_always_enabled': True,
+            'context_window': 1000000,
             'tool_deferral_mode': 'standalone',
             'supported_native_tools': frozenset(
                 {AdvisorTool, CodeExecutionTool, MCPServerTool, MemoryTool, ToolSearchTool, WebFetchTool, WebSearchTool}
@@ -448,6 +451,17 @@ def test_model_profile_fable_5_1():
     # Project Glasswing-only and not reachable with our credentials, so the rest is the mirror.
     assert profile is not None
     assert anthropic_model_profile('claude-mythos-5-1') == {**profile, 'anthropic_binds_thinking_blocks': False}
+
+
+def test_model_profile_opus_5_5():
+    """Opus 5.5 keeps adaptive thinking on, rejects forcing, and binds thinking."""
+    profile = anthropic_model_profile('claude-opus-5-5')
+    assert profile is not None
+    assert profile['anthropic_supports_adaptive_thinking'] is True
+    assert profile['anthropic_supports_forced_tool_choice'] is False
+    assert profile['anthropic_binds_thinking_blocks'] is True
+    assert profile['thinking_always_enabled'] is True
+    assert profile['context_window'] == 1_000_000
 
 
 def test_model_profile_sonnet_5():

@@ -129,6 +129,22 @@ REASONING_CASES = [
         supports_minimal_reasoning_effort=False,
         supports_context=True,
     ),
+    # GPT-6 Sol/Luna default to medium and accept none; the model guides list
+    # none/low/medium/high/xhigh/max, and the reasoning guide documents pro mode.
+    ReasoningCase(
+        model='gpt-6-sol',
+        enabled_by_default=True,
+        can_be_disabled=True,
+        supports_mode=True,
+        supports_minimal_reasoning_effort=False,
+    ),
+    ReasoningCase(
+        model='gpt-6-luna',
+        enabled_by_default=True,
+        can_be_disabled=True,
+        supports_mode=True,
+        supports_minimal_reasoning_effort=False,
+    ),
     # no reasoning
     ReasoningCase(model='gpt-5-chat'),
     ReasoningCase(model='gpt-4o'),
