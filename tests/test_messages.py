@@ -3371,6 +3371,8 @@ async def test_agent_run_rejects_non_sequence_user_prompt():
     agent = Agent(TestModel())
     with pytest.raises(ValueError, match='must be a `str` or a sequence of `UserContent` items, got `dict`'):
         await agent.run(cast(Any, {'name': 'John'}))
+
+
 @pytest.mark.parametrize('mode', ['validation', 'serialization'])
 def test_tool_return_content_url_discriminator_mapping_uses_references(mode: Literal['validation', 'serialization']):
     """Chained URL validation must still produce OpenAPI-compatible discriminator references."""

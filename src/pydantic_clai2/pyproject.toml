@@ -9,8 +9,9 @@ source = "uv-dynamic-versioning"
 [tool.uv-dynamic-versioning]
 vcs = "git"
 style = "pep440"
-bump = true
-format-jinja = "0.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"
+# The templates use the same smart bump as slim, including prerelease tags.
+bump = false
+format-jinja = "{{ '0.' ~ version.bump(smart=True).serialize().split('.', 1)[1] }}"
 
 [project]
 name = "pydantic-clai2"
@@ -23,12 +24,12 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [tool.hatch.metadata.hooks.uv-dynamic-versioning]
 dependencies = [
-    "pydantic-ai-harness[coder]==0.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}",
+    "pydantic-ai-harness[coder]=={{ '0.' ~ version.bump(smart=True).serialize().split('.', 1)[1] }}",
     # Speculative execution runs CodeMode's Monty sandbox. Pinned directly rather than via
     # `pydantic-ai-harness[code-mode]`, which also pulls a web-search client CLAI does not use.
     "pydantic-monty>=1.0.0,<2",
     # Built-in MCP client: https://github.com/pydantic/pydantic-ai-harness/issues/966.
-    "pydantic-ai-slim[anthropic,mcp,openai]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}",
+    "pydantic-ai-slim[anthropic,mcp,openai]=={{ version.bump(smart=True).serialize() }}",
     "genai-prices>=0.1.7",
     "termflow-md>=0.9.3,<0.10",
     "pyfiglet>=1.0.4",
@@ -43,7 +44,7 @@ dependencies = [
 
 # Providers whose SDK CLAI does not install by default. `/model` names the extra when it is missing.
 [tool.hatch.metadata.hooks.uv-dynamic-versioning.optional-dependencies]
-typesafe = ["pydantic-ai-slim[typesafe]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
+typesafe = ["pydantic-ai-slim[typesafe]=={{ version.bump(smart=True).serialize() }}"]
 
 [project.urls]
 Homepage = "https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_clai2"

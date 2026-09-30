@@ -2054,8 +2054,8 @@ def _support_tool_forcing(
 ) -> bool:
     """Whether to send a forced `toolChoice`, raising `UserError` if explicitly requested but unavailable.
 
-    On top of the profile's forcing flags, extended thinking rejects a forced tool choice, and adaptive thinking
-    accepts it but answers without thinking, so only an explicit forcing `tool_choice` is sent then.
+    Yantra rejects a forced choice while thinking is active. Adaptive thinking would otherwise
+    accept the forced choice but answer without thinking; implicit output tools use automatic choice.
     """
     thinking_type = _effective_thinking_type(model_settings, model_request_parameters, profile)
     if profile.get('bedrock_supports_tool_choice', False):
@@ -2064,6 +2064,8 @@ def _support_tool_forcing(
         )
     else:
         unavailable_reason = FORCING_UNSUPPORTED_REASON
+    if unavailable_reason is None and thinking_type == 'adaptive':
+        unavailable_reason = 'Bedrock does not support forcing specific tools with thinking mode.'
     if unavailable_reason is None and thinking_type == 'enabled':
         if profile.get('bedrock_thinking_variant') != 'anthropic':
             unavailable_reason = (

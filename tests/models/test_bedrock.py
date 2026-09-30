@@ -7017,10 +7017,10 @@ async def test_bedrock_empty_history_prepended_for_anthropic(bedrock_provider: B
     assert bedrock_messages == snapshot([{'role': 'user', 'content': [{'text': '.'}]}])
 
 
-async def test_bedrock_specific_tool_choice_with_adaptive_thinking_runs(
+async def test_bedrock_specific_tool_choice_with_adaptive_thinking_is_rejected(
     allow_model_requests: None, bedrock_provider: BedrockProvider
 ) -> None:
-    """A supported model sends a specific tool choice with an explicit adaptive-thinking field."""
+    """Yantra preserves thinking by rejecting a forced choice that would disable it."""
     model = BedrockConverseModel('us.anthropic.claude-sonnet-4-6', provider=bedrock_provider)
     settings = BedrockModelSettings(
         tool_choice=['get_weather'],
@@ -7041,15 +7041,8 @@ async def test_bedrock_specific_tool_choice_with_adaptive_thinking_runs(
         allow_text_output=True,
     )
 
-    with _capture_bedrock_request_bodies(model) as sent_requests:
-        response = await model.request(
-            [ModelRequest.user_text_prompt('What is the weather in Paris?')], settings, params
-        )
-
-    assert len(sent_requests) == 1
-    assert sent_requests[0]['additionalModelRequestFields']['thinking'] == {'type': 'adaptive'}
-    assert sent_requests[0]['toolConfig']['toolChoice'] == {'tool': {'name': 'get_weather'}}
-    assert response.parts == [ToolCallPart('get_weather', {'city': 'Paris'}, tool_call_id=IsStr())]
+    with pytest.raises(UserError, match='Bedrock does not support forcing specific tools with thinking mode'):
+        await model.request([ModelRequest.user_text_prompt('What is the weather in Paris?')], settings, params)
 
 
 @pytest.mark.parametrize('model_name', ['anthropic.claude-fable-5-1', 'anthropic.claude-mythos-5-1'])

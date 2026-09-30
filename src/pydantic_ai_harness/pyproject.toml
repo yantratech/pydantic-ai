@@ -12,8 +12,9 @@ source = "uv-dynamic-versioning"
 [tool.uv-dynamic-versioning]
 vcs = "git"
 style = "pep440"
-bump = true
-format-jinja = "0.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"
+# The templates use the same smart bump as slim, including prerelease tags.
+bump = false
+format-jinja = "{{ '0.' ~ version.bump(smart=True).serialize().split('.', 1)[1] }}"
 
 [project]
 name = "pydantic-ai-harness"
@@ -43,19 +44,19 @@ classifiers = [
 ]
 
 [tool.hatch.metadata.hooks.uv-dynamic-versioning]
-dependencies = ["genai-prices>=0.0.71", "httpx>=0.28.1", "json-repair>=0.58.0", "pydantic-ai-slim=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
+dependencies = ["genai-prices>=0.0.71", "httpx>=0.28.1", "json-repair>=0.58.0", "pydantic-ai-slim=={{ version.bump(smart=True).serialize() }}"]
 
 [tool.hatch.metadata.hooks.uv-dynamic-versioning.optional-dependencies]
-anthropic = ["pydantic-ai-slim[anthropic]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-cli = ["pydantic-ai-slim[cli]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-code-mode = ["pydantic-ai-slim[duckduckgo]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}", "pydantic-monty>=1.0.0,<2"]
+anthropic = ["pydantic-ai-slim[anthropic]=={{ version.bump(smart=True).serialize() }}"]
+cli = ["pydantic-ai-slim[cli]=={{ version.bump(smart=True).serialize() }}"]
+code-mode = ["pydantic-ai-slim[duckduckgo]=={{ version.bump(smart=True).serialize() }}", "pydantic-monty>=1.0.0,<2"]
 # Extras metadata has no native redirect syntax, so aliases are represented as duplicate extras.
-codemode = ["pydantic-ai-slim[duckduckgo]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}", "pydantic-monty>=1.0.0,<2"]
-researcher = ["pydantic-ai-slim[duckduckgo,web-fetch]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-temporal = ["pydantic-ai-slim[temporal]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-dbos = ["pydantic-ai-slim[dbos]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
+codemode = ["pydantic-ai-slim[duckduckgo]=={{ version.bump(smart=True).serialize() }}", "pydantic-monty>=1.0.0,<2"]
+researcher = ["pydantic-ai-slim[duckduckgo,web-fetch]=={{ version.bump(smart=True).serialize() }}"]
+temporal = ["pydantic-ai-slim[temporal]=={{ version.bump(smart=True).serialize() }}"]
+dbos = ["pydantic-ai-slim[dbos]=={{ version.bump(smart=True).serialize() }}"]
 # `logfire.variables` needs `pydantic_handlebars.extract_dependencies` (0.2.1), which logfire does not require.
-logfire = ["logfire>=4.31.0", "pydantic-ai-slim[spec]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}", "pydantic-handlebars>=0.2.1"]
+logfire = ["logfire>=4.31.0", "pydantic-ai-slim[spec]=={{ version.bump(smart=True).serialize() }}", "pydantic-handlebars>=0.2.1"]
 modal = ["modal>=1.5.2"]
 e2b = ["e2b>=2.48.0"]
 sprites = ["sprites-py>=0.7.0,<0.8"]
@@ -71,21 +72,21 @@ mongodb = ["pymongo>=4.17.0"]
 skills = ["pyyaml>=6.0.2"]
 browser-use = ["browser-use>=0.13.6,<0.14 ; python_full_version >= '3.11'"]
 playwright = ["idna>=3.4", "playwright>=1.61.0"]
-stackone = ["fastmcp>=3.4.5,<4", "pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-ordinal = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-grain = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-day-ai = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-posthog = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-pylon = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
+stackone = ["fastmcp>=3.4.5,<4", "pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+ordinal = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+grain = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+day-ai = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+posthog = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+pylon = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
 prompt-injection-defender = ["stackone-defender>=0.7.3,<0.8 ; python_full_version >= '3.11'"]
 prompt-injection-defender-ml = ["stackone-defender[onnx]>=0.7.3,<0.8 ; python_full_version >= '3.11'"]
-github = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-slack = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
+github = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+slack = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
 coder = ["ripgrep==14.1.0 ; sys_platform != 'android'"]
-logfire-mcp = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-linear = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-notion = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
-google-workspace = ["pydantic-ai-slim[mcp]=={{ major }}.{{ minor }}.{{ patch }}{% if distance %}.dev{{ distance }}+{{ commit }}{% endif %}"]
+logfire-mcp = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+linear = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+notion = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
+google-workspace = ["pydantic-ai-slim[mcp]=={{ version.bump(smart=True).serialize() }}"]
 
 [project.urls]
 Homepage = "https://pydantic.dev/docs/ai/harness/"

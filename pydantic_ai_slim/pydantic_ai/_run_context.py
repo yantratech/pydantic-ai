@@ -162,6 +162,8 @@ def context_window_fraction(messages: Sequence[_messages.ModelMessage], context_
             tokens = message.usage.total_tokens
             return tokens / context_window if tokens else None
     return None
+
+
 @dataclasses.dataclass
 class OutputBufferState:
     """Private state for incrementally built output-tool arguments."""
