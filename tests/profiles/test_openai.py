@@ -145,6 +145,11 @@ REASONING_CASES = [
         supports_mode=True,
         supports_minimal_reasoning_effort=False,
     ),
+    ReasoningCase(
+        model='gpt-6.1-sol',
+        enabled_by_default=True,
+        supports_minimal_reasoning_effort=False,
+    ),
     # no reasoning
     ReasoningCase(model='gpt-5-chat'),
     ReasoningCase(model='gpt-4o'),

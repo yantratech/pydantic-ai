@@ -106,6 +106,9 @@ _REASONING_SUPPORT_BY_PREFIX: dict[str, _ReasoningSupport] = {
     'gpt-6-astra': _ReasoningSupport(
         enabled_by_default=True, can_be_disabled=False, supports_mode=True, supports_context=True
     ),
+    # GPT-6.1 Sol always reasons; none/minimal are unsupported.
+    # https://developers.openai.com/api/docs/models/gpt-6.1-sol
+    'gpt-6.1-sol': _ALWAYS_ON_REASONING,
     # GPT-6 Sol and Luna default to medium and accept 'none', unlike Astra.
     # https://developers.openai.com/api/docs/models/gpt-6-sol
     # https://developers.openai.com/api/docs/models/gpt-6-luna
@@ -424,7 +427,7 @@ def openai_model_profile(model_name: str) -> ModelProfile:
     # gpt-6-astra (mainline continuation; not yet live-verified).
     # See https://developers.openai.com/api/docs/guides/prompt-guidance.
     supports_phase = model_name.startswith(
-        ('gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+        ('gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna')
     )
 
     # The o1-mini model doesn't support the `system` role, so we default to `user`.
@@ -434,7 +437,10 @@ def openai_model_profile(model_name: str) -> ModelProfile:
     # Check if the model supports web search (only specific search-preview models)
     supports_web_search = '-search-preview' in model_name
     supports_image_output = (
-        model_name.startswith('gpt-5') or 'o3' in model_name or '4.1' in model_name or '4o' in model_name
+        model_name.startswith(('gpt-5', 'gpt-6.1-sol'))
+        or 'o3' in model_name
+        or '4.1' in model_name
+        or '4o' in model_name
     )
 
     # OpenAI's native `tool_search` tool with `defer_loading` is available on gpt-5.4 and later
@@ -443,7 +449,7 @@ def openai_model_profile(model_name: str) -> ModelProfile:
     # this function, this enumerates known versions rather than matching open-endedly, so a new
     # family must be added here explicitly once confirmed; until then it falls back to local search.
     supports_tool_search = model_name.startswith(
-        ('gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+        ('gpt-5.4', 'gpt-5.5', 'gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna')
     )
     supported_native_tools = _OPENAI_BASE_BUILTINS | {ToolSearchTool} if supports_tool_search else _OPENAI_BASE_BUILTINS
 
@@ -451,7 +457,9 @@ def openai_model_profile(model_name: str) -> ModelProfile:
     # Chat Completions and Responses APIs. Like the other gates in this function, this enumerates
     # known versions rather than matching open-endedly.
     # See https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints.
-    supports_prompt_cache_breakpoints = model_name.startswith(('gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'))
+    supports_prompt_cache_breakpoints = model_name.startswith(
+        ('gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna')
+    )
     # Structured Outputs (output mode 'native') is only supported with the gpt-4o-mini, gpt-4o-mini-2024-07-18,
     # and gpt-4o-2024-08-06 model snapshots and later. We leave it in here for all models because the
     # `default_structured_output_mode` is `'tool'`, so `native` is only used when the user specifically uses
@@ -475,11 +483,11 @@ def openai_model_profile(model_name: str) -> ModelProfile:
         openai_supports_phase=supports_phase,
         openai_supports_prompt_cache_breakpoints=supports_prompt_cache_breakpoints,
         openai_supports_minimal_reasoning_effort=not model_name.startswith(
-            ('gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+            ('gpt-5.6', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna')
         ),
         supported_native_tools=supported_native_tools,
     )
-    if model_name.startswith(('gpt-6-sol', 'gpt-6-luna')):
+    if model_name.startswith(('gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna')):
         profile['context_window'] = 1_050_000
     return profile
 

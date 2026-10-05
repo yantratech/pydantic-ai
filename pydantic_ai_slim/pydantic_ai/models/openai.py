@@ -2779,8 +2779,6 @@ class OpenAIResponsesModel(Model[AsyncOpenAI]):
     ) -> responses.Response | AsyncStream[responses.ResponseStreamEvent] | ModelResponse:
         profile = self.profile
 
-        include = self._build_include(model_settings)
-
         request_params = await self._build_responses_request_params(
             messages,
             model_settings,
@@ -2791,6 +2789,7 @@ class OpenAIResponsesModel(Model[AsyncOpenAI]):
         model_settings = self._prepare_responses_settings(messages, OpenAIResponsesModelSettings(**model_settings))
         _drop_sampling_params_for_reasoning(profile, model_settings, model_request_parameters)
         _drop_unsupported_params(profile, model_settings)
+        include = self._build_include(model_settings)
         store: bool | Omit | None = model_settings.get('openai_store', OMIT)
         if profile.get('openai_responses_requires_store_false', False):
             store = False

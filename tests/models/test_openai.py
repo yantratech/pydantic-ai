@@ -6481,3 +6481,38 @@ def test_model_construction_preloads_lazy_dependencies():
     env = {key: value for key, value in os.environ.items() if not key.startswith('COVERAGE_')}
     process = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=120, env=env)
     assert process.returncode == 0, f'lazy-dependency preload check failed:\n{process.stderr}'
+
+
+async def test_gpt_6_1_sol_responses_filters_sampling(allow_model_requests: None):
+    from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+
+    output = ResponseOutputMessage(
+        id='msg_123',
+        type='message',
+        role='assistant',
+        status='completed',
+        content=[ResponseOutputText(text='Paris.', type='output_text', annotations=[])],
+    )
+    client = MockOpenAIResponses.create_mock(response_message([output]))
+    model = OpenAIResponsesModel('gpt-6.1-sol', provider=OpenAIProvider(openai_client=client))
+    agent = Agent(model)
+    with pytest.warns(UserWarning, match='Sampling parameters'):
+        result = await agent.run(
+            'Capital of France?',
+            model_settings=OpenAIResponsesModelSettings(
+                temperature=0.5,
+                top_p=0.9,
+                openai_top_logprobs=2,
+                openai_logprobs=True,
+                openai_reasoning_effort='low',
+            ),
+        )
+    assert result.output == 'Paris.'
+    request = get_mock_responses_kwargs(client)[0]
+    assert request['model'] == 'gpt-6.1-sol'
+    assert request['reasoning']['effort'] == 'low'
+    assert 'temperature' not in request
+    assert 'top_p' not in request
+    assert 'top_logprobs' not in request
+    assert 'message.output_text.logprobs' not in request.get('include', [])
+    assert model.profile.get('context_window') == 1_050_000
