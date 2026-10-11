@@ -488,9 +488,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+      # Same replacement for pre-commit/action as the quality job: its nested cache action is unpinned.
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          extra_args: --all-files --verbose
+          python-version: "3.13"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-3.13-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit
+        run: uvx --from pre-commit==4.5.1 pre-commit run --all-files --verbose --show-diff-on-failure
         env:
           SKIP: no-commit-to-branch,clai-help,format,lint,check-cassettes
 
