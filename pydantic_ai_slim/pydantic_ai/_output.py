@@ -1543,11 +1543,18 @@ def _buffer_status(tool_name: str, buffer: OutputBufferState | None, *, status: 
 def restore_output_buffers(
     message_history: Sequence[_messages.ModelMessage], buffered_tool_names: frozenset[str]
 ) -> dict[str, OutputBufferState]:
-    """Restore the latest model-visible buffer snapshot for deferred run continuation."""
+    """Restore the latest model-visible buffer snapshot for deferred run continuation.
+
+    Revisions only order the snapshots of one run and the continuations resuming it: a new run starts
+    again from an empty buffer. So only snapshots since the resumed run started count, and a later
+    request's snapshot replaces an earlier one. Within one request the highest revision wins, since
+    parallel calls' returns need not be in the order they ran.
+    """
     buffers: dict[str, OutputBufferState] = {}
-    for message in message_history:
+    for message in message_history[_resumed_run_start(message_history) :]:
         if not isinstance(message, _messages.ModelRequest):
             continue
+        request_buffers: dict[str, OutputBufferState] = {}
         for part in message.parts:
             if not isinstance(part, _messages.ToolReturnPart) or not isinstance(part.content, dict):
                 continue
@@ -1566,7 +1573,7 @@ def restore_output_buffers(
                 or status not in {'valid', 'invalid'}
             ):
                 continue
-            current = buffers.get(tool_name)
+            current = request_buffers.get(tool_name)
             if current is not None and current.revision > revision:
                 continue
             errors = content.get('errors')
@@ -1580,12 +1587,34 @@ def restore_output_buffers(
                     pass
                 else:
                     validation_error = _messages.RetryPromptPart(tool_name=tool_name, content=error_details)
-            buffers[tool_name] = OutputBufferState(
+            request_buffers[tool_name] = OutputBufferState(
                 raw_args=deepcopy(cast(dict[str, Any], raw_args)),
                 validation_error=validation_error,
                 revision=revision,
             )
+        buffers.update(request_buffers)
     return buffers
+
+
+def _resumed_run_start(message_history: Sequence[_messages.ModelMessage]) -> int:
+    """The index of the first message of the run that a continuation resumes, through earlier resumes.
+
+    A run that ends deferred or suspended can only be continued, never followed by a new prompt, and a
+    continuation's first request answers the open tool calls. So the resumed run is the latest one whose
+    first message is a request answering no tool calls. Without `run_id`s, the whole history counts.
+    """
+    for index in range(len(message_history) - 1, 0, -1):
+        message = message_history[index]
+        if (
+            isinstance(message, _messages.ModelRequest)
+            and message.run_id is not None
+            and message.run_id != message_history[index - 1].run_id
+            and not any(
+                isinstance(part, _messages.ToolReturnPart | _messages.RetryPromptPart) for part in message.parts
+            )
+        ):
+            return index
+    return 0
 
 
 def split_buffered_output_args(args: dict[str, Any]) -> tuple[dict[str, Any], bool]:

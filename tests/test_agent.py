@@ -799,6 +799,69 @@ def test_buffered_tool_output_survives_deferred_tool_continuation():
     assert result.output == Foo(a=1, b='buffered')
 
 
+@pytest.mark.parametrize('stage_before_deferring', [True, False], ids=['current-run-draft', 'no-current-run-draft'])
+def test_buffered_tool_output_resume_ignores_an_earlier_runs_buffer(stage_before_deferring: bool):
+    """A resumed run restores only its own drafts, though an earlier run reached a higher revision."""
+    phase = 'first-run'
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        output_tool_name = info.output_tools[0].name
+        if phase == 'first-run':
+            stages = sum(
+                isinstance(part, ToolReturnPart) and part.tool_name == output_tool_name
+                for message in messages
+                if isinstance(message, ModelRequest)
+                for part in message.parts
+            )
+            if stages < 2:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(output_tool_name, {'a': stages, 'b': 'first-run'}, tool_call_id=f'stage-{stages}')
+                    ]
+                )
+            return ModelResponse(
+                parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-1')]
+            )
+        if phase == 'second-run':
+            parts: list[ModelResponsePart] = [ToolCallPart('needs_approval', {}, tool_call_id='approval')]
+            if stage_before_deferring:
+                parts.insert(0, ToolCallPart(output_tool_name, {'a': 9, 'b': 'second-run'}, tool_call_id='stage-2'))
+            return ModelResponse(parts=parts)
+        return ModelResponse(parts=[ToolCallPart(output_tool_name, {'submit_as_final': True}, tool_call_id='submit-2')])
+
+    agent = Agent(
+        FunctionModel(return_model),
+        output_type=[ToolOutput(Foo, buffered=True), DeferredToolRequests],
+        retries={'output': 0},
+    )
+
+    @agent.tool_plain(requires_approval=True)
+    def needs_approval() -> str:
+        return 'approved'
+
+    first = agent.run_sync('First')
+    assert first.output == Foo(a=1, b='first-run')
+
+    phase = 'second-run'
+    deferred = agent.run_sync('Second', message_history=first.all_messages())
+    assert isinstance(deferred.output, DeferredToolRequests)
+
+    phase = 'resume'
+
+    def resume() -> object:
+        return agent.run_sync(
+            message_history=deferred.all_messages(),
+            deferred_tool_results=DeferredToolResults(approvals={'approval': True}),
+        ).output
+
+    if stage_before_deferring:
+        assert resume() == Foo(a=9, b='second-run')
+    else:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum output retries \(0\)'):
+            resume()
+
+
 def test_buffered_tool_output_survives_suspended_provider_continuation():
     def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         assert isinstance(messages[-1], ModelResponse)
