@@ -375,5 +375,10 @@ async def stream_run(  # noqa: C901
             output.consumer_exit_error = caller_error or GeneratorExit()
             group.cancel_scope.cancel()
     output.receiver.close()
+    if output.finished_result is not None and output._stream_response is not None:  # pyright: ignore[reportPrivateUsage]
+        # Keep raw snapshots while the public context is open, then expose the
+        # provider's finalized metadata after its normal context exit.
+        output.snapshot = deepcopy(output._stream_response.response)  # pyright: ignore[reportPrivateUsage]
+        output.settle(output.finished_result)
     if caller_error is not None:
         raise caller_error
