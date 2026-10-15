@@ -296,8 +296,9 @@ argument the model sets per call (your function never receives it; a tool with i
 
 Gotchas:
 
-- `run_stream()`/`run_stream_sync()` wait for background tools but do not deliver results; use
-  `run()`, `run_sync()`, `run_stream_events()`, or fully consume `agent.iter()`.
+- `run_stream()`/`run_stream_sync()` include background results in their settled `get_output()`;
+  append-only text deltas remain a preview of the first response. Use `run_stream_events()` for
+  all intermediate events.
 - The run waits for pending tools; a pause or early stop cancels them. Async tools must honour
   cancellation; sync tools cannot be interrupted.
 - Delivered results skip tool-result/tool-error hooks; an unexpected tool failure shows the model only the error type.

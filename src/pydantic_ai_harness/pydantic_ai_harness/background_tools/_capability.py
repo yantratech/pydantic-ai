@@ -338,7 +338,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         with self._send, self._outcomes:
             async with anyio.create_task_group() as self._task_group:
                 result = await handler()
-                # Tasks still live after a deferred-tool pause or `run_stream()` are dropped.
+                # Tasks still live after a deferred-tool pause are dropped.
                 self._task_group.cancel_scope.cancel()
             # An error from a task that finished after the last node boundary still ends the run.
             for outcome in self._arrived():

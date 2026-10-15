@@ -407,6 +407,8 @@ class AgentRun(Generic[AgentDepsT, OutputDataT]):
             return node._result  # pyright: ignore[reportPrivateUsage]
         if isinstance(node, _agent_graph.CallToolsNode) and node._next_node is not None:  # pyright: ignore[reportPrivateUsage]
             return node._next_node  # pyright: ignore[reportPrivateUsage]
+        if isinstance(node, _agent_graph.SetFinalResult):
+            return End(node.final_result)
         task = [self._node_to_task(node)]
         try:
             task = await self._graph_run.next(task)

@@ -372,7 +372,7 @@ class TestBackgroundTools:
         assert _follow_up_seen(result.all_messages(), 'failed: RuntimeError')
         assert not _follow_up_seen(result.all_messages(), 'private backend detail')
 
-    async def test_run_stream_waits_for_live_task_then_drops_its_result(self) -> None:
+    async def test_run_stream_waits_for_and_delivers_background_result(self) -> None:
         started = asyncio.Event()
         response_streamed = asyncio.Event()
         release = asyncio.Event()
@@ -380,7 +380,9 @@ class TestBackgroundTools:
         async def stream_model(
             messages: list[ModelMessage], info: AgentInfo
         ) -> AsyncIterator[str | dict[int, DeltaToolCall]]:
-            if _ack_seen(messages):
+            if _follow_up_seen(messages, 'late result'):
+                yield 'Received the late result'
+            elif _ack_seen(messages):
                 yield 'final answer'
                 response_streamed.set()
             else:
@@ -400,9 +402,9 @@ class TestBackgroundTools:
             await asyncio.wait_for(response_streamed.wait(), timeout=5)
             assert not output.done()
             release.set()
-            assert await asyncio.wait_for(output, timeout=5) == 'final answer'
+            assert await asyncio.wait_for(output, timeout=5) == 'Received the late result'
 
-        assert not _follow_up_seen(stream_result.all_messages(), 'late result')
+        assert _follow_up_seen(stream_result.all_messages(), 'late result')
 
     async def test_run_stream_events_delivers_background_result(self) -> None:
         release = asyncio.Event()

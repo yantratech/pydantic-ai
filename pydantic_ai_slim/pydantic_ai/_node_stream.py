@@ -48,6 +48,8 @@ class _NodeStreamResult(StreamedRunResult[AgentDepsT, OutputDataT], Generic[Agen
         self.snapshot: messages.ModelResponse | None = None
         self.locally_cancelled = False
         self.error_retrieved = False
+        self.consumer_exit_error: BaseException | None = None
+        self.teardown_scope: anyio.CancelScope | None = None
         self.caller_context = copy_context()
         self.consumer_context = self.caller_context
         self.owned_context = copy_context()
@@ -102,6 +104,20 @@ class _NodeStreamResult(StreamedRunResult[AgentDepsT, OutputDataT], Generic[Agen
             for token in reversed(tokens):
                 token.var.reset(token)
 
+    @asynccontextmanager
+    async def forward_consumer_exit(self) -> AsyncGenerator[None]:
+        try:
+            yield
+        except anyio.get_cancelled_exc_class():
+            if self.consumer_exit_error is not None:
+                # The consumer's exit cancels the producer to wake its current
+                # wait. Preserve the actual exit reason for background-job
+                # detach/cancel policy, then let owned teardown finish once.
+                assert self.teardown_scope is not None
+                self.teardown_scope.shield = True
+                raise self.consumer_exit_error
+            raise
+
     async def wait_result(self) -> AgentRunResult[OutputDataT] | None:
         self.error_retrieved = True
         await self.done.wait()
@@ -131,9 +147,7 @@ class _NodeStreamResult(StreamedRunResult[AgentDepsT, OutputDataT], Generic[Agen
                 None,
             )
             if response is not None:
-                if self._stream_response is not None and self._stream_response.response.parts == response.parts:
-                    self.snapshot = self._stream_response.response
-                else:
+                if self.snapshot is None or self.snapshot.parts != response.parts:
                     self.snapshot = response
             self.is_complete = True
 
@@ -162,12 +176,12 @@ class _NodeStreamResult(StreamedRunResult[AgentDepsT, OutputDataT], Generic[Agen
             last_response = update.response
             yield last_response
         if self._run_result is not None:
-            response = self._run_result.response
+            response = self.response
             if last_response is None or last_response.parts != response.parts:
                 yield response
             else:
-                last_response.run_id = response.run_id
-                last_response.conversation_id = response.conversation_id
+                last_response.run_id = self._run_result.response.run_id
+                last_response.conversation_id = self._run_result.response.conversation_id
 
     async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
         self.mode = 'delta' if delta else 'text'
@@ -221,7 +235,7 @@ async def stream_run(  # noqa: C901
     output = _NodeStreamResult[AgentDepsT, OutputDataT]()
 
     async def drive() -> AgentRunResult[OutputDataT] | None:  # noqa: C901
-        async with run_context as run:
+        async with run_context as run, output.forward_consumer_exit():
             output._all_messages = run.all_messages()  # pyright: ignore[reportPrivateUsage]
             output._new_message_index = len(run.all_messages()) - len(run.new_messages())  # pyright: ignore[reportPrivateUsage]
 
@@ -234,7 +248,7 @@ async def stream_run(  # noqa: C901
                     final: FinalResult[OutputDataT] | None = None
                     parts: list[messages.ModelRequestPart] = []
                     try:
-                        async with node.stream(graph_ctx) as stream:
+                        async with node.stream(graph_ctx) as stream, output.forward_consumer_exit():
                             final_event: messages.FinalResultEvent | None = None
 
                             async def to_final() -> AsyncIterator[messages.AgentStreamEvent]:
@@ -278,6 +292,9 @@ async def stream_run(  # noqa: C901
                                     output_parts=parts,
                                 ):
                                     pass
+                                # Keep the raw provider snapshot separate from the
+                                # settled history's attribution and derived costs.
+                                output.snapshot = deepcopy(stream.response)
                     except BaseException:
                         if parts:
                             graph_ctx.state.message_history.append(
@@ -302,7 +319,7 @@ async def stream_run(  # noqa: C901
                             )
                         return _agent_graph.SetFinalResult(final)
                 elif isinstance(node, _agent_graph.CallToolsNode):
-                    async with node.stream(graph_ctx) as stream:
+                    async with node.stream(graph_ctx) as stream, output.forward_consumer_exit():
                         if event_stream_handler is not None:
                             await event_stream_handler(run_ctx, stream)
                         async for _ in stream:
@@ -310,8 +327,15 @@ async def stream_run(  # noqa: C901
                 return await run._advance_graph(node)  # pyright: ignore[reportPrivateUsage]
 
             node = run.next_node
-            while not isinstance(node, End) and run.result is None and not output.locally_cancelled:
-                node = await run._run_node_with_hooks(node, stream_node)  # pyright: ignore[reportPrivateUsage]
+            try:
+                while not isinstance(node, End) and run.result is None and not output.locally_cancelled:
+                    node = await run._run_node_with_hooks(node, stream_node)  # pyright: ignore[reportPrivateUsage]
+            except GeneratorExit as error:
+                if error is not output.consumer_exit_error:
+                    raise
+                # The model stream has recorded a resumable detach. The enclosing
+                # run now exits normally, as it did when the consumer owned it.
+                return None
             output._all_messages = run.all_messages()  # pyright: ignore[reportPrivateUsage]
         if output.locally_cancelled:
             return None
@@ -319,14 +343,18 @@ async def stream_run(  # noqa: C901
         return run.result
 
     async def produce() -> None:
-        try:
-            output.finished_result = await drive()
-        except BaseException as error:
-            output.error = error
-        finally:
-            output.updates.close()
-            output.done.set()
-            output.ready.set()
+        with anyio.CancelScope() as teardown_scope:
+            output.teardown_scope = teardown_scope
+            try:
+                output.finished_result = await drive()
+            except BaseException as error:
+                output.error = error
+            finally:
+                if output.finished_result is None and output._stream_response is not None:  # pyright: ignore[reportPrivateUsage]
+                    output.snapshot = deepcopy(output._stream_response.response)  # pyright: ignore[reportPrivateUsage]
+                output.updates.close()
+                output.done.set()
+                output.ready.set()
 
     caller_error: BaseException | None = None
     async with anyio.create_task_group() as group:
@@ -344,6 +372,7 @@ async def stream_run(  # noqa: C901
             # task group's ExceptionGroup. Producer errors are retrieved above.
             caller_error = error
         finally:
+            output.consumer_exit_error = caller_error or GeneratorExit()
             group.cancel_scope.cancel()
     output.receiver.close()
     if caller_error is not None:

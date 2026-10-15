@@ -12,6 +12,7 @@ import anyio
 import pytest
 
 from pydantic_ai import Agent, CallToolsNode, ModelRequestNode, RunContext
+from pydantic_ai._agent_graph import SetFinalResult
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.capabilities.abstract import AgentNode, NodeResult, WrapNodeRunHandler
 from pydantic_ai.messages import (
@@ -149,3 +150,32 @@ async def test_native_stream_validator_context_does_not_retain_a_reset_caller_va
         caller.reset(token)
         assert [chunk async for chunk in chunks] == ['ab']
     assert observed == ['first', 'unset', 'unset']
+
+
+async def test_native_stream_final_handoff_preserves_an_already_validated_answer():
+    requests = 0
+    handoffs = 0
+
+    async def model(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        nonlocal requests
+        requests += 1
+        yield 'Validated answer'
+
+    class ExpireFinalHandoff(AbstractCapability[None]):
+        async def wrap_node_run(
+            self, ctx: RunContext[None], *, node: AgentNode[None], handler: WrapNodeRunHandler[None]
+        ) -> NodeResult[None]:
+            nonlocal handoffs
+            if isinstance(node, SetFinalResult):
+                handoffs += 1
+                # Publishing an already validated answer has no asynchronous work.
+                # An expired node budget must not interrupt a graph-worker handoff.
+                with anyio.fail_after(0):
+                    return await handler(node)
+            return await handler(node)
+
+    agent = Agent(FunctionModel(stream_function=model), deps_type=NoneType, capabilities=[ExpireFinalHandoff()])
+    async with agent.run_stream('Start') as result:
+        assert await result.get_output() == 'Validated answer'
+    assert requests == 1
+    assert handoffs == 1
