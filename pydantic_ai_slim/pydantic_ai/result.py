@@ -702,10 +702,7 @@ class StreamedRunResult(Generic[AgentDepsT, OutputDataT]):
                 Debouncing is particularly important for long structured responses to reduce the overhead of
                 performing validation as each token is received.
         """
-        if self._run_result is not None:  # pragma: no cover
-            # We can't really get here, as `_run_result` is only set in `run_stream` when `CallToolsNode` produces `DeferredToolRequests` output
-            # as a result of a tool function raising `CallDeferred` or `ApprovalRequired`.
-            # That'll change if we ever support something like `raise EndRun(output: OutputT)` where `OutputT` could be `str`.
+        if self._run_result is not None:
             if not isinstance(self._run_result.output, str):
                 raise exceptions.UserError('stream_text() can only be used with text responses')
             yield self._run_result.output
@@ -891,8 +888,7 @@ class StreamedRunResult(Generic[AgentDepsT, OutputDataT]):
         """Whether the stream has been cancelled via `cancel()`."""
         if self._stream_response is not None:
             return self._stream_response.cancelled
-        # Only reachable via a `wrap_run` short-circuit, where there is no stream.
-        return False  # pragma: no cover
+        return False
 
 
 class StreamedRunResultSync(Generic[AgentDepsT, OutputDataT]):

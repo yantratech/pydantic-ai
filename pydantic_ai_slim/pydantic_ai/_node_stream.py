@@ -332,7 +332,10 @@ async def stream_run(  # noqa: C901
                     node = await run._run_node_with_hooks(node, stream_node)  # pyright: ignore[reportPrivateUsage]
             except GeneratorExit as error:
                 if error is not output.consumer_exit_error:
-                    raise
+                    # Normal generator closure uses the owned exit instance. A
+                    # callback raising GeneratorExit itself is unsupported, but
+                    # must never be mistaken for a clean consumer detach.
+                    raise  # pragma: no cover
                 # The model stream has recorded a resumable detach. The enclosing
                 # run now exits normally, as it did when the consumer owned it.
                 return None

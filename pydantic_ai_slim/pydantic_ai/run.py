@@ -404,11 +404,11 @@ class AgentRun(Generic[AgentDepsT, OutputDataT]):
         # its cached outcome needs no graph-worker round trip: cancelling that
         # handoff can otherwise close the graph iterator after a successful tool.
         if isinstance(node, _agent_graph.ModelRequestNode) and node._result is not None:  # pyright: ignore[reportPrivateUsage]
-            return node._result  # pyright: ignore[reportPrivateUsage]
+            return await node.run(self.ctx)
         if isinstance(node, _agent_graph.CallToolsNode) and node._next_node is not None:  # pyright: ignore[reportPrivateUsage]
             return node._next_node  # pyright: ignore[reportPrivateUsage]
         if isinstance(node, _agent_graph.SetFinalResult):
-            return End(node.final_result)
+            return await node.run(self.ctx)
         task = [self._node_to_task(node)]
         try:
             task = await self._graph_run.next(task)

@@ -3079,7 +3079,7 @@ class TestNodeStreamingWithHooks:
 
         @agent.tool_plain
         def my_tool() -> str:
-            return 'tool result'
+            assert False, 'A failing node wrapper must prevent tool execution'
 
         with pytest.raises(RuntimeError, match='wrap error'):
             async with agent.run_stream('hello') as _streamed:
