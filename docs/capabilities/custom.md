@@ -523,7 +523,9 @@ Capabilities can hook into five lifecycle points, each with up to four variants:
 Node hooks fire however the run is driven: [`agent.run()`][pydantic_ai.agent.AbstractAgent.run], [`agent_run.next()`][pydantic_ai.run.AgentRun.next], and `async for node in agent_run:` over [`agent.iter()`][pydantic_ai.agent.Agent.iter] all take the same path.
 
 !!! note
-    [`agent.run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] is the exception: it hands you the result as soon as the final output is found mid-stream, so the model request that produced it gets `before_node_run` but not `wrap_node_run` or `after_node_run`. If a hook does cleanup or result rewriting that has to run for every node, drive the run with `agent.run()` or `agent.iter()` instead.
+    [`agent.run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] also runs the complete node lifecycle, including the final model response. Its producer owns provider iteration and node hooks while the caller consumes output, so a hook can interrupt and recover a node without cancelling caller code between chunks.
+
+    A recovered node can replace a partially streamed answer. `get_output()` and `result` expose the settled result, and cumulative `stream_text()` can yield the replacement. Append-only `stream_text(delta=True)` keeps the first response's deltas as a preview; it cannot retract those chunks or append an unrelated replacement. Read the settled result after consuming the preview.
 
 ```python {title="node_logging_example.py"}
 from __future__ import annotations

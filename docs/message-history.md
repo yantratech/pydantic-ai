@@ -106,7 +106,7 @@ async def main():
         """
 
         async for text in result.stream_text():
-            print(text)
+            print(text.rstrip())
             #> Did you hear
             #> Did you hear about the toothpaste
             #> Did you hear about the toothpaste scandal? They called
@@ -134,7 +134,9 @@ async def main():
                         content='Did you hear about the toothpaste scandal? They called it Colgate.'
                     )
                 ],
-                usage=RequestUsage(input_tokens=50, output_tokens=12),
+                usage=RequestUsage(
+                    cost=Decimal('0.0002555'), input_tokens=50, output_tokens=12
+                ),
                 model_name='gpt-5.2',
                 timestamp=datetime.datetime(...),
                 run_id='...',

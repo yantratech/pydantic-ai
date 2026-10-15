@@ -122,9 +122,10 @@ stopping.
 
 ## Limitations
 
-- `run_stream()` and `run_stream_sync()` wait for background tools but do not deliver their results.
-  The streamed response may only say that the work has started. Use `run_stream_events()`, `run()`,
-  `run_sync()`, or consume all of `agent.iter()` when the final response needs the result.
+- With `run_stream()` and `run_stream_sync()`, an initial text response can arrive before background
+  tools finish. The settled result includes their follow-up; use `get_output()` for the final answer.
+  Append-only text deltas remain a preview of the first response, while cumulative streaming can
+  replace it after the tool results arrive.
 - A sequential tool can overlap background work that started earlier. Tools that must not overlap
   should protect their shared data or should not run in the background.
 - Realtime sessions already run tools concurrently, so `BackgroundTools` leaves them unchanged.

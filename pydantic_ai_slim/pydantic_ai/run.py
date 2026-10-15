@@ -400,6 +400,15 @@ class AgentRun(Generic[AgentDepsT, OutputDataT]):
         node: _agent_graph.AgentNode[AgentDepsT, Any],
     ) -> _agent_graph.AgentNode[AgentDepsT, Any] | End[FinalResult[Any]]:
         """Execute a single graph step without firing capability hooks."""
+        # A streamed node has already done its work in the driver task. Publishing
+        # its cached outcome needs no graph-worker round trip: cancelling that
+        # handoff can otherwise close the graph iterator after a successful tool.
+        if isinstance(node, _agent_graph.ModelRequestNode) and node._result is not None:  # pyright: ignore[reportPrivateUsage]
+            return await node.run(self.ctx)
+        if isinstance(node, _agent_graph.CallToolsNode) and node._next_node is not None:  # pyright: ignore[reportPrivateUsage]
+            return node._next_node  # pyright: ignore[reportPrivateUsage]
+        if isinstance(node, _agent_graph.SetFinalResult):
+            return await node.run(self.ctx)
         task = [self._node_to_task(node)]
         try:
             task = await self._graph_run.next(task)

@@ -246,3 +246,18 @@ def test_lookup_context_window_unknown_model_and_provider():
     assert lookup_context_window('potato-gpt', provider_name='openai') is None
     assert lookup_context_window('gpt-5', provider_name='not-a-provider') is None
     assert lookup_context_window('gpt-5') is None
+
+
+@requires_openai
+async def test_native_response_usage_preserves_cost_when_the_node_settles(allow_model_requests: None):
+    model = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=MockOpenAI.create_mock_stream(_chunks())))
+    agent = Agent(model)
+    async with agent.iter('hello') as run:
+        async for node in run:
+            if Agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as stream:
+                    assert await stream.get_output() == 'world'
+                    assert stream.usage.cost == Decimal('0.00075')
+                assert stream.usage.cost == Decimal('0.00075')
+    assert run.result is not None
+    assert run.result.usage.cost == Decimal('0.00075')

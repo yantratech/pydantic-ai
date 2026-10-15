@@ -89,6 +89,8 @@ async def audit_tool(
 agent = Agent('openai:gpt-5.2', name='hooks_agent', capabilities=[hooks])
 ```
 
+Native `run_stream()` executes the full node-hook lifecycle, including the final model response, on its producer. For recoverable step deadlines, scope cancellation inside `wrap_node_run`; cancelling the whole run remains terminal. Recovery may replace streamed output: `get_output()` and `result` are authoritative, while append-only text deltas remain a preview of the first response.
+
 Important hook families:
 
 - run-level hooks

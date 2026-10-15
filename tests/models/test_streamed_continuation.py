@@ -1117,6 +1117,8 @@ async def test_run_stream_early_break_records_suspended_and_resumes() -> None:
     assert isinstance(messages[-1], ModelResponse)
     assert messages[-1].state == 'suspended'
     assert messages[-1].provider_response_id == 'job1'
+    assert result.response.state == 'suspended'
+    assert result.all_messages() == messages
 
     # Resume: feed the persisted suspended history to a fresh run; it issues the continuation.
     resume_model = _ScriptedModel(

@@ -16,7 +16,7 @@ from concurrent.futures import Executor
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from types import FrameType, TracebackType
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, cast, overload
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, overload
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream
@@ -43,7 +43,7 @@ from .._run_context import set_current_run_context
 from ..capabilities import AgentCapability
 from ..exceptions import RunCancelled
 from ..output import OutputDataT, OutputSpec
-from ..result import AgentStream, FinalResult, StreamedRunResult
+from ..result import FinalResult
 from ..run import AgentRun, AgentRunResult, AgentRunResultEvent
 from ..settings import ModelSettings
 from ..template import TemplateStr
@@ -893,7 +893,7 @@ class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
     ) -> AbstractAsyncContextManager[result.StreamedRunResult[AgentDepsT, RunOutputDataT]]: ...
 
     @asynccontextmanager
-    async def run_stream(  # noqa: C901
+    async def run_stream(
         self,
         user_prompt: str | Sequence[_messages.UserContent] | None = None,
         *,
@@ -985,8 +985,9 @@ class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
 
         event_stream_handler = event_stream_handler or self.event_stream_handler
 
-        yielded = False
-        async with self.iter(
+        from .._node_stream import stream_run
+
+        run_context = self.iter(
             user_prompt,
             output_type=output_type,
             message_history=message_history,
@@ -1007,149 +1008,9 @@ class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
             capabilities=capabilities,
             workspace=workspace,
             spec=spec,
-        ) as agent_run:
-            # Handle wrap_run short-circuit: result is already available
-            if agent_run.result is not None:
-                graph_ctx = agent_run.ctx
-                yield StreamedRunResult(
-                    graph_ctx.state.message_history,
-                    graph_ctx.deps.new_message_index,
-                    run_result=agent_run.result,
-                )
-                yielded = True
-
-            first_node = agent_run.next_node  # start with the first node
-            assert isinstance(first_node, _agent_graph.UserPromptNode)  # the first node should be a user prompt node
-            node: _agent_graph.AgentNode[Any, Any] = first_node
-            while not yielded:
-                graph_ctx = agent_run.ctx
-                # Fire before_node_run BEFORE streaming so that node replacement
-                # happens before any model call, avoiding double execution.
-                run_ctx = _agent_graph.build_run_context(graph_ctx)
-                cap = graph_ctx.deps.root_capability
-                node = await cap.before_node_run(run_ctx, node=node)
-
-                if self.is_model_request_node(node):
-                    async with node.stream(graph_ctx) as stream:
-                        final_result_event = None
-
-                        async def stream_to_final(
-                            stream: AgentStream,
-                        ) -> AsyncIterator[_messages.AgentStreamEvent]:
-                            nonlocal final_result_event
-                            async for event in stream:
-                                yield event
-                                if isinstance(event, _messages.FinalResultEvent):
-                                    final_result_event = event
-                                    break
-
-                        # `node.stream()` applies the capability chain, so `stream_to_final` truncates
-                        # the handler's view at the final result without hiding later events from
-                        # capabilities: the rest of the stream still flows through them as it's consumed.
-                        truncated = stream_to_final(stream)
-                        if event_stream_handler is not None:
-                            await event_stream_handler(run_ctx, truncated)
-                        # Drain after the handler (same as the `run()` path) so the response is fully
-                        # built; cancellation/`break` interrupt the handler and don't reach here.
-                        async for _ in truncated:
-                            pass
-
-                        if final_result_event is not None:
-                            final_result = FinalResult(
-                                None, final_result_event.tool_name, final_result_event.tool_call_id
-                            )
-                            yielded = True
-
-                            messages = graph_ctx.state.message_history.copy()
-
-                            async def on_complete() -> None:
-                                """Called when the stream has completed.
-
-                                The model response will have been added to messages by now
-                                by `StreamedRunResult._marked_completed`.
-                                """
-                                nonlocal final_result
-                                final_result = FinalResult(
-                                    await stream.get_output(), final_result.tool_name, final_result.tool_call_id
-                                )
-
-                                # When we get here, the `ModelRequestNode` has completed streaming after the final result was found.
-                                # When running an agent with `agent.run`, we'd then move to `CallToolsNode` to execute the tool calls and
-                                # find the final result.
-                                # We also want to execute tool calls (in case `agent.end_strategy` is not `'early'`) here, but
-                                # we don't want to run the `CallToolsNode` logic to determine the final output, as it would be
-                                # wasteful and could produce a different result (e.g. when text output is followed by tool calls).
-                                # So we call `process_tool_calls` directly and then end the run with the found final result.
-
-                                parts: list[_messages.ModelRequestPart] = []
-                                async for _event in _agent_graph.process_tool_calls(
-                                    tool_manager=graph_ctx.deps.tool_manager,
-                                    tool_calls=stream.response.tool_calls,
-                                    tool_call_results=None,
-                                    tool_call_metadata=None,
-                                    final_result=final_result,
-                                    ctx=graph_ctx,
-                                    output_parts=parts,
-                                ):
-                                    pass
-
-                                # To allow this message history to be used in a future run without dangling tool calls,
-                                # append a new ModelRequest using the tool returns and retries
-                                if parts:
-                                    messages.append(
-                                        _messages.ModelRequest(
-                                            parts,
-                                            run_id=graph_ctx.state.run_id,
-                                            conversation_id=graph_ctx.state.conversation_id,
-                                            timestamp=_utils.now_utc(),
-                                        )
-                                    )
-
-                                await agent_run.next(_agent_graph.SetFinalResult(final_result))
-
-                            yield StreamedRunResult(
-                                messages,
-                                graph_ctx.deps.new_message_index,
-                                stream,
-                                on_complete,
-                            )
-                            # Note: wrap_node_run/after_node_run are intentionally skipped here.
-                            # before_node_run fired above; on_complete() later calls
-                            # agent_run.next(SetFinalResult(...)) which fires the full lifecycle
-                            # for SetFinalResult, but not for this ModelRequestNode.
-                            break
-                elif self.is_call_tools_node(node):
-                    async with node.stream(agent_run.ctx) as stream:
-                        if event_stream_handler is not None:
-                            await event_stream_handler(run_ctx, stream)
-                        # Drain after the handler, same as the `ModelRequestNode` branch above, so the
-                        # capability chain `node.stream()` wrapped around the node's events finalizes here.
-                        async for _ in stream:
-                            pass
-
-                # Advance graph with remaining hooks (before_node_run already fired above).
-                # Rebuild run_ctx after streaming so hooks see post-streaming state (e.g. run_step).
-                run_ctx = _agent_graph.build_run_context(graph_ctx)
-                next_node = await agent_run._wrap_and_advance(run_ctx, node, agent_run._advance_graph)  # pyright: ignore[reportPrivateUsage]
-                if isinstance(next_node, End) and agent_run.result is not None:
-                    # A final output could have been produced by the CallToolsNode rather than the ModelRequestNode,
-                    # if a tool function raised CallDeferred or ApprovalRequired.
-                    # In this case there's no response to stream, but we still let the user access the output etc as normal.
-                    yield StreamedRunResult(
-                        graph_ctx.state.message_history,
-                        graph_ctx.deps.new_message_index,
-                        run_result=agent_run.result,
-                    )
-                    yielded = True
-                    break
-                if not isinstance(next_node, _agent_graph.AgentNode):
-                    raise exceptions.AgentRunError(  # pragma: lax no cover
-                        'Should have produced a StreamedRunResult before getting here'
-                    )
-                node = cast(_agent_graph.AgentNode[Any, Any], next_node)
-
-        if not yielded:
-            raise exceptions.AgentRunError('Agent run finished without producing a final result')  # pragma: no cover
+        )
+        async with stream_run(run_context, event_stream_handler) as streamed_result:
+            yield streamed_result
 
     @overload
     def run_stream_sync(

@@ -73,7 +73,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
     def __post_init__(self):
         self._initial_run_ctx_usage = deepcopy(self._run_ctx.usage)
 
-    async def stream_output(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+    async def stream_output(self, *, debounce_by: float | None = 0.1) -> AsyncGenerator[OutputDataT]:
         """Asynchronously stream the (validated) agent outputs."""
         if self._cached_output is not None:
             yield deepcopy(self._cached_output)
@@ -102,7 +102,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
             self._cached_output = await self.validate_response_output(response)
             yield deepcopy(self._cached_output)
 
-    async def stream_response(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[_messages.ModelResponse]:
+    async def stream_response(self, *, debounce_by: float | None = 0.1) -> AsyncGenerator[_messages.ModelResponse]:
         """Asynchronously stream the (unvalidated) model responses for the agent.
 
         Yields `ModelResponse` snapshots — `state='incomplete'` while streaming is in flight,
@@ -123,7 +123,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
 
         yield self.response  # final state='complete' (or 'interrupted')
 
-    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncGenerator[str]:
         """Stream the text result as an async iterable.
 
         !!! note
@@ -702,10 +702,7 @@ class StreamedRunResult(Generic[AgentDepsT, OutputDataT]):
                 Debouncing is particularly important for long structured responses to reduce the overhead of
                 performing validation as each token is received.
         """
-        if self._run_result is not None:  # pragma: no cover
-            # We can't really get here, as `_run_result` is only set in `run_stream` when `CallToolsNode` produces `DeferredToolRequests` output
-            # as a result of a tool function raising `CallDeferred` or `ApprovalRequired`.
-            # That'll change if we ever support something like `raise EndRun(output: OutputT)` where `OutputT` could be `str`.
+        if self._run_result is not None:
             if not isinstance(self._run_result.output, str):
                 raise exceptions.UserError('stream_text() can only be used with text responses')
             yield self._run_result.output
@@ -891,8 +888,7 @@ class StreamedRunResult(Generic[AgentDepsT, OutputDataT]):
         """Whether the stream has been cancelled via `cancel()`."""
         if self._stream_response is not None:
             return self._stream_response.cancelled
-        # Only reachable via a `wrap_run` short-circuit, where there is no stream.
-        return False  # pragma: no cover
+        return False
 
 
 class StreamedRunResultSync(Generic[AgentDepsT, OutputDataT]):
