@@ -251,7 +251,9 @@ def model_response_payload_errors(model_name: str) -> Generator[None]:
         yield
 
 
-_ValidatedActivityConfig = with_config(ConfigDict(extra='forbid'))(
+# Temporal can include runtime handles (such as EventGroup) in activity options.
+# Preserve their native instance checks alongside key and scalar validation.
+_ValidatedActivityConfig = with_config(ConfigDict(extra='forbid', arbitrary_types_allowed=True))(
     TypedDict(
         '_ValidatedActivityConfig',
         # The functional syntax is intentionally dynamic so new Temporal keys are included.
