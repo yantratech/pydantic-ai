@@ -809,15 +809,11 @@ class AbstractCapability(ABC, Generic[AgentDepsT]):
         [`agent.run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream], an
         [`agent.iter()`][pydantic_ai.agent.Agent.iter] run advanced with
         [`agent_run.next()`][pydantic_ai.run.AgentRun.next], and a bare `async for node in agent_run:`
-        loop, which advances through `next()` too. The one exception is the final
-        [`ModelRequestNode`][pydantic_ai.agent.ModelRequestNode] under `run_stream()`, which hands back
-        the result mid-stream and so only fires `before_node_run`.
+        loop, which advances through `next()` too.
 
-        When using `agent.run()` with `event_stream_handler`, the handler wraps both
-        streaming and graph advancement (i.e. the model call happens inside the wrapper).
-        When using `agent.run_stream()`, the handler wraps only graph advancement — streaming
-        happens before the wrapper because `run_stream()` must yield the stream to the caller
-        while the stream context is still open, which cannot happen from inside a callback.
+        Streaming and graph advancement both happen inside the handler. Native `run_stream()`
+        owns them on a producer task, including the final model response, so a node-local
+        interruption can recover without cancelling caller code between streamed chunks.
 
         A cancelled run delivers `asyncio.CancelledError` through `handler()`. Cancellation is
         terminal: the hook may observe it and clean up, but cannot recover the run to success —

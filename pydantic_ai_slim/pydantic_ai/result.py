@@ -73,7 +73,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
     def __post_init__(self):
         self._initial_run_ctx_usage = deepcopy(self._run_ctx.usage)
 
-    async def stream_output(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+    async def stream_output(self, *, debounce_by: float | None = 0.1) -> AsyncGenerator[OutputDataT]:
         """Asynchronously stream the (validated) agent outputs."""
         if self._cached_output is not None:
             yield deepcopy(self._cached_output)
@@ -102,7 +102,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
             self._cached_output = await self.validate_response_output(response)
             yield deepcopy(self._cached_output)
 
-    async def stream_response(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[_messages.ModelResponse]:
+    async def stream_response(self, *, debounce_by: float | None = 0.1) -> AsyncGenerator[_messages.ModelResponse]:
         """Asynchronously stream the (unvalidated) model responses for the agent.
 
         Yields `ModelResponse` snapshots — `state='incomplete'` while streaming is in flight,
@@ -123,7 +123,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
 
         yield self.response  # final state='complete' (or 'interrupted')
 
-    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncGenerator[str]:
         """Stream the text result as an async iterable.
 
         !!! note

@@ -3012,13 +3012,8 @@ class TestNodeStreamingWithHooks:
         assert output == 'streamed response'
         assert model_call_count == 1, f'Model was called {model_call_count} times, expected 1'
 
-    async def test_run_stream_skips_wrap_and_after_for_the_final_model_request(self):
-        """`run_stream()` hands back the result mid-stream, so the final `ModelRequestNode` only gets `before_node_run`.
-
-        Pinning the documented exception to "node hooks fire however the run is driven": that node's
-        `wrap_node_run`/`after_node_run` are deliberately skipped, while the `SetFinalResult` node
-        that ends the run gets the full lifecycle.
-        """
+    async def test_run_stream_wraps_the_final_model_request(self):
+        """Native streaming keeps the final provider stream inside the full node-hook lifecycle."""
         log: list[str] = []
 
         @dataclass
@@ -3049,6 +3044,8 @@ class TestNodeStreamingWithHooks:
                 'wrap:UserPromptNode',
                 'after:UserPromptNode',
                 'before:ModelRequestNode',
+                'wrap:ModelRequestNode',
+                'after:ModelRequestNode',
                 'before:SetFinalResult',
                 'wrap:SetFinalResult',
                 'after:SetFinalResult',
